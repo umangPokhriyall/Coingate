@@ -1,0 +1,6 @@
+api/.env
+poller/.env
+processor/.env
+store/.env
+worker/.env
+target/

@@ -1,0 +1,31 @@
+[package]
+name = "api"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+actix-web = "4.11.0"
+tokio = "1.47.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = {version = "1.17.0", features = ["serde",  "v4"]}
+chrono = { version = "0.4", features = ["serde"] }
+bigdecimal = { version = "0.4", features = ["serde"] }
+
+store = { path="../store"}
+jsonwebtoken = "9.3.1"
+bcrypt = "0.17.1"
+base64 = "0.22.1"
+solana-sdk = "2.2.19" # match your Solana CLI version
+solana-client = "2.2.19"
+
+spl-associated-token-account = "7.0.0"
+spl-token = "8.0.0"
+
+spl-memo = "3.0.1"   
+anyhow = "1.0"
+
+num-traits = "0.2"
+solana-program = "3.0.0"
+reqwest = "0.12.23"
+redis = "0.24"

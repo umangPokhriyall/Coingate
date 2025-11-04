@@ -1,0 +1,507 @@
+use crate::module::*;
+use crate::schema::*;
+use crate::store::Store;
+use bigdecimal::BigDecimal;
+use chrono::Utc;
+use diesel::prelude::*;
+use diesel::result::DatabaseErrorKind;
+use diesel::result::Error;
+use uuid::Uuid;
+
+impl Store {
+    // ============ Merchants ============
+    pub fn insert_merchant(&mut self, merchant: Merchant) -> Result<Merchant, Error> {
+        diesel::insert_into(merchants::table)
+            .values(&merchant)
+            .returning(Merchant::as_returning())
+            .get_result(&mut self.conn)
+    }
+
+    pub fn find_merchant_by_email(&mut self, email_: &str) -> Result<Merchant, Error> {
+        use crate::schema::merchants::dsl::*;
+        merchants
+            .filter(email.eq(email_))
+            .select(Merchant::as_select())
+            .first(&mut self.conn)
+    }
+
+    pub fn find_merchant_by_id(&mut self, mid: Uuid) -> Result<Merchant, Error> {
+        use crate::schema::merchants::dsl::*;
+        merchants
+            .filter(id.eq(mid))
+            .select(Merchant::as_select())
+            .first(&mut self.conn)
+    }
+    pub fn get_merchant_id_for_app(&mut self, app_uuid: Uuid) -> Result<Uuid, Error> {
+        use crate::schema::apps::dsl::*;
+        let app: App = apps
+            .filter(id.eq(app_uuid))
+            .select(App::as_select())
+            .first(&mut self.conn)?;
+        Ok(app.merchant_id.expect("App must always have a merchant_id"))
+    }
+
+    // ============ Apps ============
+    pub fn insert_app(&mut self, app: App) -> Result<App, Error> {
+        diesel::insert_into(apps::table)
+            .values(&app)
+            .returning(App::as_returning())
+            .get_result(&mut self.conn)
+    }
+
+    pub fn list_apps_by_merchant(&mut self, mid: Uuid) -> Result<Vec<App>, Error> {
+        use crate::schema::apps::dsl::*;
+        apps.filter(merchant_id.eq(mid))
+            .select(App::as_select())
+            .load(&mut self.conn)
+    }
+
+    pub fn find_app_by_token(&mut self, token: &str) -> Result<App, diesel::result::Error> {
+        use bcrypt::verify;
+
+        let all_apps: Vec<App> = apps::table.load::<App>(&mut self.conn)?;
+        for a in all_apps {
+            if verify(token, &a.token_hash).unwrap_or(false) {
+                return Ok(a);
+            }
+        }
+        Err(diesel::result::Error::NotFound)
+    }
+
+    // ============ Orders ============
+    pub fn insert_order(&mut self, order: Order) -> Result<Order, Error> {
+        use crate::schema::orders::dsl::*;
+        diesel::insert_into(orders)
+            .values(&order)
+            .returning(Order::as_returning())
+            .get_result(&mut self.conn)
+    }
+
+    pub fn find_order(&mut self, oid: Uuid) -> Result<Order, Error> {
+        use crate::schema::orders::dsl::*;
+        orders
+            .filter(id.eq(oid))
+            .select(Order::as_select())
+            .first(&mut self.conn)
+    }
+
+    pub fn find_order_by_app(&mut self, oid: Uuid, app_uuid: Uuid) -> Result<Order, Error> {
+        use crate::schema::orders::dsl::*;
+        orders
+            .filter(id.eq(oid).and(app_id.eq(app_uuid)))
+            .select(Order::as_select())
+            .first(&mut self.conn)
+    }
+
+    pub fn find_order_by_memo_id(&mut self, memo: &str) -> Result<Order, Error> {
+        use crate::schema::orders::dsl::*;
+        orders
+            .filter(memo_id.eq(memo))
+            .select(Order::as_select())
+            .first(&mut self.conn)
+    }
+    pub fn update_order(&mut self, order: Order) -> Result<Order, Error> {
+        use crate::schema::orders::dsl::*;
+        diesel::update(orders.filter(id.eq(order.id)))
+            .set((
+                status.eq(order.status.clone()),
+                tx_hash.eq(order.tx_hash.clone()),
+                selected_mint.eq(order.selected_mint.clone()),
+                expected_amount.eq(order.expected_amount.clone()),
+                expected_decimals.eq(order.expected_decimals),
+                confirmed_at.eq(order.confirmed_at),
+            ))
+            .returning(Order::as_returning())
+            .get_result(&mut self.conn)
+    }
+
+    // ============ Wallets ============
+    pub fn get_fat_wallet(&mut self) -> Result<Wallet, diesel::result::Error> {
+        use crate::schema::wallets::dsl::*;
+        wallets
+            .filter(type_.eq("fat"))
+            .first::<Wallet>(&mut self.conn)
+    }
+
+    pub fn insert_wallet(&mut self, wallet: Wallet) -> Result<Wallet, diesel::result::Error> {
+        diesel::insert_into(crate::schema::wallets::table)
+            .values(&wallet)
+            .returning(Wallet::as_returning())
+            .get_result(&mut self.conn)
+    }
+
+    // ============ Audit Logs ============
+    pub fn insert_audit(&mut self, log: AuditLog) -> Result<AuditLog, Error> {
+        diesel::insert_into(audit_logs::table)
+            .values(&log)
+            .returning(AuditLog::as_returning())
+            .get_result(&mut self.conn)
+    }
+    pub fn get_token_decimals(&mut self, token_mint_: &str) -> Result<u8, Error> {
+        use crate::schema::deposits::dsl::*;
+        deposits
+            .filter(token_mint.eq(token_mint_))
+            .select(token_decimals)
+            .first::<Option<i32>>(&mut self.conn)
+            .map(|opt| opt.unwrap_or(0) as u8)
+    }
+
+    pub fn insert_deposit(&mut self, mut dep: Deposit) -> Result<Deposit, Error> {
+        use crate::schema::deposits::dsl::*;
+        // set created_at if not set
+        if dep.created_at.is_none() {
+            dep.created_at = Some(Utc::now().naive_utc());
+        }
+        let conn = &mut self.conn;
+        match diesel::insert_into(deposits)
+            .values(&dep)
+            .returning(Deposit::as_returning())
+            .get_result(conn)
+        {
+            Ok(d) => Ok(d),
+            Err(Error::DatabaseError(DatabaseErrorKind::UniqueViolation, _)) => {
+                // if tx_hash exists, increment processing_attempts
+                let existing: Deposit = deposits
+                    .filter(tx_hash.eq(&dep.tx_hash))
+                    .select(Deposit::as_select())
+                    .first(conn)?;
+                let new_attempts = existing.processing_attempts.unwrap_or(0) + 1;
+                let updated: Deposit = diesel::update(deposits.filter(id.eq(existing.id)))
+                    .set((
+                        processing_attempts.eq(new_attempts),
+                        updated_at.eq(Some(Utc::now().naive_utc())),
+                    ))
+                    .returning(Deposit::as_returning())
+                    .get_result(conn)?;
+                Ok(updated)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn mark_deposit_processed(
+        &mut self,
+        txhash: &str,
+        confirmed_at_ts: Option<chrono::NaiveDateTime>,
+    ) -> Result<Deposit, Error> {
+        use crate::schema::deposits::dsl::*;
+        diesel::update(deposits.filter(tx_hash.eq(txhash)))
+            .set((
+                processed.eq(true),
+                status.eq("verified"),
+                confirmed_at.eq(confirmed_at_ts),
+                updated_at.eq(Some(Utc::now().naive_utc())),
+            ))
+            .returning(Deposit::as_returning())
+            .get_result(&mut self.conn)
+    }
+
+    // === Balances ===
+    pub fn upsert_balance(
+        &mut self,
+        merchant_id_: Uuid,
+        token_mint_: &str,
+        amount_: &BigDecimal,
+    ) -> Result<Balance, Error> {
+        use crate::schema::balances::dsl::*;
+        use diesel::dsl::now;
+
+        diesel::insert_into(balances)
+            .values((
+                merchant_id.eq(merchant_id_),
+                token_mint.eq(token_mint_.to_string()),
+                balance.eq(amount_.clone()),
+                locked_balance.eq(BigDecimal::from(0)), // ensure init
+                updated_at.eq(Utc::now().naive_utc()),
+            ))
+            .on_conflict((merchant_id, token_mint))
+            .do_update()
+            .set((
+                balance.eq(balance + amount_.clone()),
+                updated_at.eq(Utc::now().naive_utc()),
+            ))
+            .returning(Balance::as_returning())
+            .get_result(&mut self.conn)
+    }
+
+    pub fn get_balance(&mut self, merchant_id_: Uuid, token_mint_: &str) -> Result<Balance, Error> {
+        use crate::schema::balances::dsl::*;
+        balances
+            .filter(merchant_id.eq(merchant_id_))
+            .filter(token_mint.eq(token_mint_.to_string()))
+            .select(Balance::as_select())
+            .first(&mut self.conn)
+    }
+
+    // === Withdrawals ===
+    pub fn create_withdrawal(
+        &mut self,
+        merchant_id_: Uuid,
+        token_mint_: &str,
+        amount_: &BigDecimal,
+        target_address_: &str,
+    ) -> Result<Withdrawal, Error> {
+        use crate::schema::withdrawals::dsl::*;
+
+        diesel::insert_into(withdrawals)
+            .values((
+                merchant_id.eq(merchant_id_),
+                token_mint.eq(token_mint_.to_string()),
+                amount.eq(amount_.clone()),
+                status.eq("pending"),
+                target_address.eq(target_address_.to_string()),
+                created_at.eq(Utc::now().naive_utc()),
+            ))
+            .returning(Withdrawal::as_returning())
+            .get_result(&mut self.conn)
+    }
+
+    pub fn update_withdrawal_status(
+        &mut self,
+        withdrawal_id_: Uuid,
+        new_status_: &str,
+        tx_hash_: Option<&str>,
+    ) -> Result<Withdrawal, Error> {
+        use crate::schema::withdrawals::dsl::*;
+
+        diesel::update(withdrawals.find(withdrawal_id_))
+            .set((
+                status.eq(new_status_.to_string()),
+                tx_hash.eq(tx_hash_.map(|s| s.to_string())),
+                updated_at.eq(Utc::now().naive_utc()),
+            ))
+            .returning(Withdrawal::as_returning())
+            .get_result(&mut self.conn)
+    }
+
+    // Insert/update/lock funds and create withdrawal in single DB transaction.
+    // Returns created Withdrawal row.
+    pub fn create_withdrawal_and_lock(
+        &mut self,
+        merchant_id_: Uuid,
+        token_mint_: &str,
+        amount_: &BigDecimal,
+        target_address_: &str,
+    ) -> Result<Withdrawal, Error> {
+        use crate::schema::balances::dsl as b;
+        use crate::schema::withdrawals::dsl as w;
+
+        let conn = &mut self.conn;
+
+        conn.transaction::<Withdrawal, Error, _>(|conn| {
+            // Fetch or create balance row for merchant + token
+            // attempt to select the balance row FOR UPDATE
+            let bal_opt = b::balances
+                .filter(b::merchant_id.eq(merchant_id_))
+                .filter(b::token_mint.eq(token_mint_.to_string()))
+                .for_update() // lock row
+                .first::<Balance>(conn)
+                .optional()?;
+
+            let mut balance_row = match bal_opt {
+                Some(bal) => bal,
+                None => {
+                    // create balance row with zeroes
+                    let new_bal = Balance {
+                        id: Uuid::new_v4(),
+                        merchant_id: merchant_id_,
+                        token_mint: token_mint_.to_string(),
+                        balance: Some(BigDecimal::from(0)),
+                        locked_balance: Some(BigDecimal::from(0)),
+                        updated_at: Some(Utc::now().naive_utc()),
+                    };
+                    diesel::insert_into(b::balances)
+                        .values(&new_bal)
+                        .execute(conn)?;
+                    new_bal
+                }
+            };
+
+            // read current values (may be None => treat as 0)
+            let curr_balance = balance_row
+                .balance
+                .clone()
+                .unwrap_or_else(|| BigDecimal::from(0));
+            let curr_locked = balance_row
+                .locked_balance
+                .clone()
+                .unwrap_or_else(|| BigDecimal::from(0));
+
+            // check sufficient funds
+            if &curr_balance < amount_ {
+                return Err(Error::RollbackTransaction); // signal insufficient funds
+            }
+
+            // new values
+            let new_balance = &curr_balance - amount_;
+            let new_locked = &curr_locked + amount_;
+
+            // update balance row
+            diesel::update(b::balances.filter(b::id.eq(balance_row.id)))
+                .set((
+                    b::balance.eq(new_balance.clone()),
+                    b::locked_balance.eq(new_locked.clone()),
+                    b::updated_at.eq(Utc::now().naive_utc()),
+                ))
+                .execute(conn)?;
+
+            // create withdrawal record (status = pending)
+            let withdrawal = Withdrawal {
+                id: Uuid::new_v4(),
+                merchant_id: merchant_id_,
+                token_mint: token_mint_.to_string(),
+                amount: amount_.clone(),
+                status: "pending".to_string(),
+                target_address: target_address_.to_string(),
+                tx_hash: None,
+                created_at: Some(Utc::now().naive_utc()),
+                updated_at: Some(Utc::now().naive_utc()),
+            };
+
+            let inserted: Withdrawal = diesel::insert_into(w::withdrawals)
+                .values(&withdrawal)
+                .get_result(conn)?;
+
+            Ok(inserted)
+        })
+    }
+
+    // If you failed to push to redis, revert lock: atomically move locked_balance -> balance
+    pub fn revert_withdrawal_lock(
+        &mut self,
+        merchant_id_: Uuid,
+        token_mint_: &str,
+        amount_: &BigDecimal,
+    ) -> Result<Balance, Error> {
+        use crate::schema::balances::dsl::*;
+        let conn = &mut self.conn;
+        conn.transaction::<Balance, Error, _>(|conn| {
+            // lock balance row
+            let mut bal = balances
+                .filter(merchant_id.eq(merchant_id_))
+                .filter(token_mint.eq(token_mint_.to_string()))
+                .for_update()
+                .first::<Balance>(conn)?;
+
+            let curr_locked = bal
+                .locked_balance
+                .clone()
+                .unwrap_or_else(|| BigDecimal::from(0));
+            let curr_balance = bal.balance.clone().unwrap_or_else(|| BigDecimal::from(0));
+
+            let new_locked = &curr_locked - amount_;
+            let new_balance = &curr_balance + amount_;
+
+            let updated: Balance = diesel::update(balances.filter(id.eq(bal.id)))
+                .set((
+                    balance.eq(new_balance.clone()),
+                    locked_balance.eq(new_locked.clone()),
+                    updated_at.eq(Utc::now().naive_utc()),
+                ))
+                .get_result(conn)?;
+
+            Ok(updated)
+        })
+    }
+
+    // After worker succeeds, finalize withdrawal: set status completed, deduct locked_balance
+    pub fn finalize_withdrawal_success(
+        &mut self,
+        withdrawal_id_: Uuid,
+        tx_hash_: &str,
+    ) -> Result<Withdrawal, Error> {
+        use crate::schema::balances::dsl as b;
+        use crate::schema::withdrawals::dsl as w;
+
+        let conn = &mut self.conn;
+
+        conn.transaction::<Withdrawal, Error, _>(|conn| {
+            // find withdrawal
+            let wd = w::withdrawals
+                .find(withdrawal_id_)
+                .first::<Withdrawal>(conn)?;
+
+            // set status = completed and tx_hash
+            let updated_wd: Withdrawal = diesel::update(w::withdrawals.find(wd.id))
+                .set((
+                    w::status.eq("completed"),
+                    w::tx_hash.eq(Some(tx_hash_.to_string())),
+                    w::updated_at.eq(Utc::now().naive_utc()),
+                ))
+                .get_result(conn)?;
+
+            // reduce locked_balance (it was already deducted from balance at lock time)
+            // lock balance row and subtract from locked_balance
+            let mut bal = b::balances
+                .filter(b::merchant_id.eq(wd.merchant_id))
+                .filter(b::token_mint.eq(wd.token_mint.clone()))
+                .for_update()
+                .first::<Balance>(conn)?;
+
+            let curr_locked = bal
+                .locked_balance
+                .clone()
+                .unwrap_or_else(|| BigDecimal::from(0));
+            let new_locked = curr_locked - wd.amount.clone();
+
+            let _ = diesel::update(b::balances.filter(b::id.eq(bal.id)))
+                .set((
+                    b::locked_balance.eq(new_locked),
+                    b::updated_at.eq(Utc::now().naive_utc()),
+                ))
+                .execute(conn)?;
+
+            Ok(updated_wd)
+        })
+    }
+
+    // On failure: set withdrawal.status = failed and restore locked->balance
+    pub fn finalize_withdrawal_failed(
+        &mut self,
+        withdrawal_id_: Uuid,
+        failure_reason: &str,
+    ) -> Result<Withdrawal, Error> {
+        use crate::schema::balances::dsl as b;
+        use crate::schema::withdrawals::dsl as w;
+
+        let conn = &mut self.conn;
+        conn.transaction::<Withdrawal, Error, _>(|conn| {
+            let wd = w::withdrawals
+                .find(withdrawal_id_)
+                .first::<Withdrawal>(conn)?;
+
+            // set status = failed
+            let updated_wd: Withdrawal = diesel::update(w::withdrawals.find(wd.id))
+                .set((
+                    w::status.eq("failed"),
+                    w::updated_at.eq(Utc::now().naive_utc()),
+                ))
+                .get_result(conn)?;
+
+            // move locked back to balance
+            let mut bal = b::balances
+                .filter(b::merchant_id.eq(wd.merchant_id))
+                .filter(b::token_mint.eq(wd.token_mint.clone()))
+                .for_update()
+                .first::<Balance>(conn)?;
+
+            let curr_locked = bal
+                .locked_balance
+                .clone()
+                .unwrap_or_else(|| BigDecimal::from(0));
+            let curr_balance = bal.balance.clone().unwrap_or_else(|| BigDecimal::from(0));
+            let new_locked = &curr_locked - wd.amount.clone();
+            let new_balance = &curr_balance + wd.amount.clone();
+
+            let _ = diesel::update(b::balances.filter(b::id.eq(bal.id)))
+                .set((
+                    b::balance.eq(new_balance),
+                    b::locked_balance.eq(new_locked),
+                    b::updated_at.eq(Utc::now().naive_utc()),
+                ))
+                .execute(conn)?;
+
+            Ok(updated_wd)
+        })
+    }
+}
