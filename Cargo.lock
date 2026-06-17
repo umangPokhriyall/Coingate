@@ -2409,6 +2409,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "idempotency"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.16",
+ "uuid",
+]
+
+[[package]]
 name = "ident_case"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
