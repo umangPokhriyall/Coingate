@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 redis = "0.24"
 store = { path = "../store" } # link your store crate
+external = { path = "../external" } # Signer trait + MpcSigner
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -13,8 +14,6 @@ uuid = {version = "1.17.0", features = ["serde",  "v4"]}
 chrono = { version = "0.4", features = ["serde"] }
 bigdecimal = { version = "0.4", features = ["serde"] }
 anyhow = "1.0"
-dotenv = "0.15"
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.11", features = ["json", "blocking", "rustls-tls"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

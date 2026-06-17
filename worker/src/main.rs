@@ -1,7 +1,7 @@
 use anyhow::Result;
 use bigdecimal::{BigDecimal, ToPrimitive};
+use external::{MpcSigner, SendRequest, Signer, SignerError};
 use redis::Value as RedisValue;
-use reqwest::Client;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -123,6 +123,13 @@ async fn main() -> Result<()> {
     let mut conn = client.get_connection()?;
     let pool = build_pool(&cfg).expect("failed to build database pool");
 
+    // The fat wallet (the MPC send endpoint) is fixed; resolve it once and inject the signer.
+    let mut db = get_conn(&pool).expect("failed to get DB connection");
+    let fat_wallet = store::get_fat_wallet(&mut db).expect("fat wallet not configured");
+    drop(db);
+    let send_url = format!("http://127.0.0.1:3000/wallets/{}/send", fat_wallet.id);
+    let signer = MpcSigner::new(send_url);
+
     let group = "withdrawals_group";
     let consumer = format!("withdrawer-{}", uuid::Uuid::new_v4());
 
@@ -148,7 +155,7 @@ async fn main() -> Result<()> {
         for (stream, redis_id, data_str) in parse_xreadgroup_response(xauto) {
             match parse_withdrawal_payload(&data_str) {
                 Ok(payload) => {
-                    process_withdrawal(&pool, &payload, &mut conn, group, &stream, &redis_id)
+                    process_withdrawal(&pool, &signer, &payload, &mut conn, group, &stream, &redis_id)
                         .await?;
                 }
                 Err(e) => warn!(error = %e, %stream, %redis_id, "malformed withdrawal payload, skipping"),
@@ -171,7 +178,7 @@ async fn main() -> Result<()> {
         for (stream, redis_id, data_str) in parse_xreadgroup_response(xread) {
             match parse_withdrawal_payload(&data_str) {
                 Ok(payload) => {
-                    process_withdrawal(&pool, &payload, &mut conn, group, &stream, &redis_id)
+                    process_withdrawal(&pool, &signer, &payload, &mut conn, group, &stream, &redis_id)
                         .await?;
                 }
                 Err(e) => warn!(error = %e, %stream, %redis_id, "malformed withdrawal payload, skipping"),
@@ -180,8 +187,9 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn process_withdrawal(
+async fn process_withdrawal<S: Signer>(
     pool: &Pool,
+    signer: &S,
     payload: &WithdrawalPayload,
     conn: &mut redis::Connection,
     group: &str,
@@ -199,23 +207,10 @@ async fn process_withdrawal(
     let _ = store::update_withdrawal_status(&mut db, withdrawal_id, "processing", None)?;
     debug!(%withdrawal_id, "withdrawal status set to 'processing'");
 
-    // Get the fat wallet
-    let fat_wallet = store::get_fat_wallet(&mut db)?;
-    let mpc_url = format!("http://127.0.0.1:3000/wallets/{}/send", fat_wallet.id);
-    debug!(%mpc_url, "sending request to MPC");
-
     // Determine if token or SOL
     let is_sol = payload.token_mint == "So11111111111111111111111111111111111111112";
-    let (mint_param, token_param) = if is_sol {
-        (None, None)
-    } else {
-        (
-            Some(payload.token_mint.as_str()),
-            Some(payload.token_mint.as_str()),
-        )
-    };
 
-    // Convert amount to smallest unit
+    // Convert amount to smallest unit (unchanged logic)
     let amount_u64 = if is_sol {
         let lamports_per_sol = 1_000_000_000u64;
         (payload.amount.clone() * BigDecimal::from(lamports_per_sol))
@@ -232,63 +227,49 @@ async fn process_withdrawal(
 
     debug!(amount = %payload.amount, amount_base_units = amount_u64, "converted withdrawal amount");
 
-    // Build request body for MPC
-    let req_body = if mint_param.is_some() {
-        serde_json::json!({
-            "to": payload.target_address,
-            "amount": amount_u64,
-            "mint": mint_param,
-            "token": token_param
-        })
+    // Send through the Signer trait, passing key = withdrawal_id (the effect idempotency key).
+    // Phase 0 still calls send on the happy path; status-guard + lookup reconciliation is Phase 1.4.
+    let mint = if is_sol {
+        None
     } else {
-        serde_json::json!({
-            "to": payload.target_address,
-            "amount": amount_u64
-        })
+        Some(payload.token_mint.as_str())
+    };
+    let req = SendRequest {
+        key: withdrawal_id,
+        to: &payload.target_address,
+        amount: amount_u64,
+        mint,
     };
 
-    debug!(%req_body, "MPC request body");
-
-    // Send request
-    let cli = Client::new();
-    match cli.post(&mpc_url).json(&req_body).send().await {
-        Ok(r) => {
-            if r.status().is_success() {
-                let json: Value = r.json().await.unwrap_or_default();
-                if let Some(sig) = json.get("signature").and_then(|s| s.as_str()) {
-                    with_tx(pool, |c| store::finalize_withdrawal_success(c, withdrawal_id, sig))?;
-                    let _: () = redis::cmd("XACK")
-                        .arg(stream)
-                        .arg(group)
-                        .arg(redis_id)
-                        .query(conn)?;
-                    info!(%withdrawal_id, %sig, "withdrawal completed successfully");
-                } else {
-                    with_tx(pool, |c| {
-                        store::finalize_withdrawal_failed(c, withdrawal_id, "mpc_no_sig")
-                    })?;
-                    let _: () = redis::cmd("XACK")
-                        .arg(stream)
-                        .arg(group)
-                        .arg(redis_id)
-                        .query(conn)?;
-                    warn!(%withdrawal_id, "withdrawal failed: no signature returned");
-                }
-            } else {
-                let body = r.text().await.unwrap_or_default();
-                with_tx(pool, |c| {
-                    store::finalize_withdrawal_failed(c, withdrawal_id, &format!("mpc_error: {}", body))
-                })?;
-                let _: () = redis::cmd("XACK")
-                    .arg(stream)
-                    .arg(group)
-                    .arg(redis_id)
-                    .query(conn)?;
-                warn!(%withdrawal_id, %body, "withdrawal failed: MPC error");
-            }
+    match signer.send(req).await {
+        Ok(sig) => {
+            let sig = sig.to_string();
+            with_tx(pool, |c| {
+                store::finalize_withdrawal_success(c, withdrawal_id, &sig)
+            })?;
+            let _: () = redis::cmd("XACK")
+                .arg(stream)
+                .arg(group)
+                .arg(redis_id)
+                .query(conn)?;
+            info!(%withdrawal_id, %sig, "withdrawal completed successfully");
+        }
+        Err(SignerError::Transport(e)) => {
+            // Ambiguous: we do not know if the MPC sent. Leave the withdrawal `processing`
+            // and do NOT ack — Phase 1.4 reconciles via lookup instead of re-sending.
+            error!(%withdrawal_id, error = %e, "transport error calling MPC; leaving withdrawal pending");
         }
         Err(e) => {
-            error!(%withdrawal_id, error = %e, "network error calling MPC");
+            // Definite failure (rejected / no signature): finalize as failed and ack.
+            with_tx(pool, |c| {
+                store::finalize_withdrawal_failed(c, withdrawal_id, &e.to_string())
+            })?;
+            let _: () = redis::cmd("XACK")
+                .arg(stream)
+                .arg(group)
+                .arg(redis_id)
+                .query(conn)?;
+            warn!(%withdrawal_id, error = %e, "withdrawal failed");
         }
     }
 
