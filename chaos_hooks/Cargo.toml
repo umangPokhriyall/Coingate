@@ -1,0 +1,10 @@
+[package]
+name = "chaos_hooks"
+version = "0.1.0"
+edition = "2024"
+
+# No external dependencies (Phase 0 hard rule #7). Hand-rolled macro + registry.
+
+[features]
+# OFF by default: without this feature the crash-point machinery compiles to nothing.
+chaos = []
