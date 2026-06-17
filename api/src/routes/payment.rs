@@ -1,10 +1,6 @@
 use actix_web::{HttpResponse, Responder, get, post, web};
 use serde::{Deserialize, Serialize};
-use std::{
-    str::FromStr,
-    sync::{Arc, Mutex},
-};
-use store::store::Store;
+use std::str::FromStr;
 use uuid::Uuid;
 
 use base64::{Engine as _, engine::general_purpose};
@@ -48,12 +44,15 @@ pub struct PaymentPageResponse {
 #[get("/payments/{order_id}")]
 pub async fn get_payment_details(
     path: web::Path<String>,
-    store: web::Data<Arc<Mutex<Store>>>,
+    pool: web::Data<store::Pool>,
 ) -> impl Responder {
     let oid = Uuid::parse_str(&path.into_inner()).unwrap();
-    let mut store = store.lock().unwrap();
+    let mut conn = match pool.get() {
+        Ok(c) => c,
+        Err(_) => return HttpResponse::InternalServerError().finish(),
+    };
 
-    match store.find_order(oid) {
+    match store::find_order(&mut conn, oid) {
         Ok(order) => {
             // Convert base units back to human readable format for display
             let display_amount =
@@ -73,7 +72,7 @@ pub async fn get_payment_details(
 #[get("/payments/{order_id}/status")]
 pub async fn get_payment_status(
     path: web::Path<String>,
-    store: web::Data<Arc<Mutex<Store>>>,
+    pool: web::Data<store::Pool>,
 ) -> impl Responder {
     // Parse UUID
     let order_id = match Uuid::parse_str(&path.into_inner()) {
@@ -82,9 +81,12 @@ pub async fn get_payment_status(
     };
 
     // Access store
-    let mut store = store.lock().unwrap();
+    let mut conn = match pool.get() {
+        Ok(c) => c,
+        Err(_) => return HttpResponse::InternalServerError().finish(),
+    };
 
-    match store.find_order(order_id) {
+    match store::find_order(&mut conn, order_id) {
         Ok(order) => {
             // Convert base units to display amount
             let display_amount = order.price_amount.clone() / BigDecimal::from(1_000_000);
@@ -107,19 +109,16 @@ pub async fn get_payment_status(
 pub async fn create_payment_tx(
     path: web::Path<String>,
     req: web::Json<PaymentTxRequest>,
-    store: web::Data<Arc<Mutex<Store>>>,
+    pool: web::Data<store::Pool>,
 ) -> impl Responder {
     let oid = Uuid::parse_str(&path.into_inner()).unwrap();
-    let mut s = match store.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => {
-            eprintln!("⚠️ Store mutex poisoned, recovering...");
-            poisoned.into_inner()
-        }
+    let mut conn = match pool.get() {
+        Ok(c) => c,
+        Err(_) => return HttpResponse::InternalServerError().finish(),
     };
 
     // 1. Fetch order
-    let mut order = match s.find_order(oid) {
+    let mut order = match store::find_order(&mut conn, oid) {
         Ok(o) => o,
         Err(_) => {
             return HttpResponse::NotFound().json(ErrorResponse {
@@ -129,7 +128,7 @@ pub async fn create_payment_tx(
     };
 
     // 2. Fat wallet (merchant's settlement wallet)
-    let fat_wallet = match s.get_fat_wallet() {
+    let fat_wallet = match store::get_fat_wallet(&mut conn) {
         Ok(w) => w,
         Err(_) => {
             return HttpResponse::InternalServerError().json(ErrorResponse {
@@ -166,7 +165,7 @@ pub async fn create_payment_tx(
                 order.selected_mint = Some(mint_str.clone());
                 order.expected_amount = Some(expected_amount.into());
                 order.expected_decimals = Some(decimals.into());
-                s.update_order(order.clone()).unwrap();
+                store::update_order(&mut conn, order.clone()).unwrap();
 
                 (expected_amount, decimals, Some(mint_pubkey))
             } else {
@@ -193,7 +192,7 @@ pub async fn create_payment_tx(
                 order.selected_mint = Some(mint_str.clone());
                 order.expected_amount = Some(out_amount.into());
                 order.expected_decimals = Some(decimals.into());
-                s.update_order(order.clone()).unwrap();
+                store::update_order(&mut conn, order.clone()).unwrap();
 
                 (out_amount, decimals, Some(mint_pubkey))
             }
@@ -218,7 +217,7 @@ pub async fn create_payment_tx(
             order.selected_mint = Some(sol_mint.to_string());
             order.expected_amount = Some(out_amount.into());
             order.expected_decimals = Some(9.into()); // SOL has 9 decimals
-            s.update_order(order.clone()).unwrap();
+            store::update_order(&mut conn, order.clone()).unwrap();
 
             // For SOL, return None as mint_pubkey_opt to trigger native SOL transfer
             (out_amount, 9, None)

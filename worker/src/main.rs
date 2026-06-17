@@ -5,7 +5,7 @@ use reqwest::Client;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::str::FromStr;
-use store::store::Store;
+use store::{Config, Pool, build_pool, get_conn, with_tx};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -108,9 +108,10 @@ fn parse_withdrawal_payload(data_str: &str) -> Result<WithdrawalPayload> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let client = redis::Client::open("redis://127.0.0.1:6379")?;
+    let cfg = Config::from_env().expect("invalid configuration (check required env vars)");
+    let client = redis::Client::open(cfg.redis_url.clone())?;
     let mut conn = client.get_connection()?;
-    let mut store = Store::new()?;
+    let pool = build_pool(&cfg).expect("failed to build database pool");
 
     let group = "withdrawals_group";
     let consumer = format!("withdrawer-{}", uuid::Uuid::new_v4());
@@ -136,7 +137,7 @@ async fn main() -> Result<()> {
 
         for (stream, redis_id, data_str) in parse_xreadgroup_response(xauto) {
             if let Ok(payload) = parse_withdrawal_payload(&data_str) {
-                process_withdrawal(&mut store, &payload, &mut conn, group, &stream, &redis_id)
+                process_withdrawal(&pool, &payload, &mut conn, group, &stream, &redis_id)
                     .await?;
             }
         }
@@ -156,7 +157,7 @@ async fn main() -> Result<()> {
 
         for (stream, redis_id, data_str) in parse_xreadgroup_response(xread) {
             if let Ok(payload) = parse_withdrawal_payload(&data_str) {
-                process_withdrawal(&mut store, &payload, &mut conn, group, &stream, &redis_id)
+                process_withdrawal(&pool, &payload, &mut conn, group, &stream, &redis_id)
                     .await?;
             }
         }
@@ -164,7 +165,7 @@ async fn main() -> Result<()> {
 }
 
 async fn process_withdrawal(
-    store: &mut Store,
+    pool: &Pool,
     payload: &WithdrawalPayload,
     conn: &mut redis::Connection,
     group: &str,
@@ -178,12 +179,15 @@ async fn process_withdrawal(
         withdrawal_id, stream, redis_id
     );
 
+    // Pooled connection for the pre-send, single-statement DB work.
+    let mut db = get_conn(pool)?;
+
     // Update status to 'processing'
-    let _ = store.update_withdrawal_status(withdrawal_id, "processing", None)?;
+    let _ = store::update_withdrawal_status(&mut db, withdrawal_id, "processing", None)?;
     println!("⏳ Withdrawal {} status set to 'processing'", withdrawal_id);
 
     // Get the fat wallet
-    let fat_wallet = store.get_fat_wallet()?;
+    let fat_wallet = store::get_fat_wallet(&mut db)?;
     let mpc_url = format!("http://127.0.0.1:3000/wallets/{}/send", fat_wallet.id);
     println!("📡 Sending request to MPC at {}", mpc_url);
 
@@ -205,10 +209,13 @@ async fn process_withdrawal(
             .to_u64()
             .unwrap_or(0)
     } else {
-        let decimals = store.get_token_decimals(&payload.token_mint)?; // fetch decimals from DB
+        let decimals = store::get_token_decimals(&mut db, &payload.token_mint)?; // fetch decimals from DB
         let factor = BigDecimal::from(10u64.pow(decimals as u32));
         (payload.amount.clone() * factor).to_u64().unwrap_or(0)
     };
+
+    // Done with pooled DB connection before the MPC network call.
+    drop(db);
 
     println!("💰 Original payload amount: {}", payload.amount);
     println!("💰 Converted to u64 smallest unit: {}", amount_u64);
@@ -237,7 +244,7 @@ async fn process_withdrawal(
             if r.status().is_success() {
                 let json: Value = r.json().await.unwrap_or_default();
                 if let Some(sig) = json.get("signature").and_then(|s| s.as_str()) {
-                    store.finalize_withdrawal_success(withdrawal_id, sig)?;
+                    with_tx(pool, |c| store::finalize_withdrawal_success(c, withdrawal_id, sig))?;
                     let _: () = redis::cmd("XACK")
                         .arg(stream)
                         .arg(group)
@@ -248,7 +255,9 @@ async fn process_withdrawal(
                         withdrawal_id, sig
                     );
                 } else {
-                    store.finalize_withdrawal_failed(withdrawal_id, "mpc_no_sig")?;
+                    with_tx(pool, |c| {
+                        store::finalize_withdrawal_failed(c, withdrawal_id, "mpc_no_sig")
+                    })?;
                     let _: () = redis::cmd("XACK")
                         .arg(stream)
                         .arg(group)
@@ -261,7 +270,9 @@ async fn process_withdrawal(
                 }
             } else {
                 let body = r.text().await.unwrap_or_default();
-                store.finalize_withdrawal_failed(withdrawal_id, &format!("mpc_error: {}", body))?;
+                with_tx(pool, |c| {
+                    store::finalize_withdrawal_failed(c, withdrawal_id, &format!("mpc_error: {}", body))
+                })?;
                 let _: () = redis::cmd("XACK")
                     .arg(stream)
                     .arg(group)

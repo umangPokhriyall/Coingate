@@ -5,7 +5,7 @@ use redis::Value as RedisValue;
 use serde_json::Value;
 use std::collections::HashMap;
 use store::module::Deposit;
-use store::store::Store;
+use store::{Config, PgConnection, build_pool, get_conn};
 
 #[derive(Debug, Clone)]
 struct StreamTransaction {
@@ -110,13 +110,13 @@ fn parse_transaction_data(
     })
 }
 
-async fn process_transaction(store: &mut Store, tx: &StreamTransaction) -> Result<bool> {
+async fn process_transaction(conn: &mut PgConnection, tx: &StreamTransaction) -> Result<bool> {
     let memo = match &tx.memo_id {
         Some(m) => m.clone(),
         None => return Ok(false),
     };
 
-    let order = match store.find_order_by_memo_id(&memo) {
+    let order = match store::find_order_by_memo_id(conn, &memo) {
         Ok(o) => o,
         Err(_) => return Ok(false),
     };
@@ -126,8 +126,8 @@ async fn process_transaction(store: &mut Store, tx: &StreamTransaction) -> Resul
     }
 
     let verification_result = match tx.transaction_type.as_str() {
-        "SOL" => verify_sol_transaction(store, &order, tx),
-        "TOKEN" => verify_token_transaction(store, &order, tx),
+        "SOL" => verify_sol_transaction(&order, tx),
+        "TOKEN" => verify_token_transaction(&order, tx),
         _ => Ok(false),
     }?;
 
@@ -137,7 +137,7 @@ async fn process_transaction(store: &mut Store, tx: &StreamTransaction) -> Resul
         updated_order.status = "paid".to_string();
         updated_order.tx_hash = Some(tx.signature.clone());
         updated_order.confirmed_at = Some(Utc::now().naive_utc());
-        store.update_order(updated_order)?;
+        store::update_order(conn, updated_order)?;
 
         // ✅ Insert deposit
         let deposit_amount = BigDecimal::from(tx.amount.unwrap_or(0));
@@ -169,12 +169,12 @@ async fn process_transaction(store: &mut Store, tx: &StreamTransaction) -> Resul
             updated_at: Some(Utc::now().naive_utc()),
             confirmed_at: Some(Utc::now().naive_utc()),
         };
-        store.insert_deposit(deposit)?;
+        store::insert_deposit(conn, deposit)?;
 
         // ✅ Update merchant balance
         if let Some(app_id) = order.app_id {
-            let merchant_id = store.get_merchant_id_for_app(app_id)?;
-            store.upsert_balance(merchant_id, &token_mint, &deposit_amount)?;
+            let merchant_id = store::get_merchant_id_for_app(conn, app_id)?;
+            store::upsert_balance(conn, merchant_id, &token_mint, &deposit_amount)?;
             println!("✅ Updated balance for merchant {}", merchant_id);
         }
 
@@ -185,7 +185,6 @@ async fn process_transaction(store: &mut Store, tx: &StreamTransaction) -> Resul
 }
 
 fn verify_sol_transaction(
-    _store: &mut Store,
     order: &store::module::Order,
     tx: &StreamTransaction,
 ) -> Result<bool> {
@@ -199,7 +198,6 @@ fn verify_sol_transaction(
 }
 
 fn verify_token_transaction(
-    _store: &mut Store,
     order: &store::module::Order,
     tx: &StreamTransaction,
 ) -> Result<bool> {
@@ -225,9 +223,11 @@ fn verify_token_transaction(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let client = redis::Client::open("redis://127.0.0.1:6379")?;
+    let cfg = Config::from_env().expect("invalid configuration (check required env vars)");
+    let client = redis::Client::open(cfg.redis_url.clone())?;
     let mut conn = client.get_connection()?;
-    let mut store = Store::new()?;
+    let pool = build_pool(&cfg).expect("failed to build database pool");
+    let mut db_conn = get_conn(&pool).expect("failed to get DB connection");
 
     let group = "processor_group";
     let consumer = format!("consumer-{}", uuid::Uuid::new_v4());
@@ -262,7 +262,7 @@ async fn main() -> Result<()> {
 
         for (stream, id, data_str) in parse_xreadgroup_response(resp) {
             match parse_transaction_data(&stream, &id, &data_str) {
-                Ok(tx) => match process_transaction(&mut store, &tx).await {
+                Ok(tx) => match process_transaction(&mut db_conn, &tx).await {
                     Ok(true) | Ok(false) => {
                         let _: () = redis::cmd("XACK")
                             .arg(&stream)
@@ -295,7 +295,7 @@ async fn main() -> Result<()> {
 
         for (stream, id, data_str) in parse_xreadgroup_response(resp) {
             match parse_transaction_data(&stream, &id, &data_str) {
-                Ok(tx) => match process_transaction(&mut store, &tx).await {
+                Ok(tx) => match process_transaction(&mut db_conn, &tx).await {
                     Ok(true) | Ok(false) => {
                         let _: () = redis::cmd("XACK")
                             .arg(&stream)

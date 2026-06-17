@@ -1,5 +1,4 @@
 use anyhow::Result;
-use dotenv::dotenv;
 use redis::Commands;
 use solana_client::{
     nonblocking::rpc_client::RpcClient, rpc_client::GetConfirmedSignaturesForAddress2Config,
@@ -10,7 +9,7 @@ use solana_transaction_status::{
     option_serializer::OptionSerializer,
 };
 use std::str::FromStr;
-use store::store::Store;
+use store::{Config, build_pool, get_conn};
 use tokio::time::{Duration, sleep};
 
 #[derive(Debug)]
@@ -31,22 +30,23 @@ struct TransactionData {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    dotenv().ok();
+    let cfg = Config::from_env().expect("invalid configuration (check required env vars)");
 
     // Connect Redis
-    let redis_client = redis::Client::open("redis://127.0.0.1/")?;
+    let redis_client = redis::Client::open(cfg.redis_url.clone())?;
     let mut redis_conn = redis_client.get_connection()?;
 
-    // Connect DB and get fat wallet
-    let mut store = Store::new().expect("DB connection failed");
-    let fat_wallet = store.get_fat_wallet().expect("fat wallet not configured");
+    // Connect DB (pooled) and get fat wallet
+    let pool = build_pool(&cfg).expect("failed to build database pool");
+    let mut db_conn = get_conn(&pool).expect("failed to get DB connection");
+    let fat_wallet = store::get_fat_wallet(&mut db_conn).expect("fat wallet not configured");
     let fat_pubkey = Pubkey::from_str(&fat_wallet.address).expect("invalid pubkey");
 
     println!("🔑 Polling for wallet: {}", fat_pubkey);
 
     // Solana client
     let rpc = RpcClient::new_with_commitment(
-        "https://api.devnet.solana.com".to_string(),
+        cfg.solana_rpc_url.clone(),
         CommitmentConfig::confirmed(),
     );
 

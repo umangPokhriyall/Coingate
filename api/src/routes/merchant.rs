@@ -1,4 +1,3 @@
-use actix_web::web::Data;
 use actix_web::{HttpRequest, HttpResponse, Responder, get, post, web};
 use bcrypt::{hash, verify};
 use bigdecimal::BigDecimal;
@@ -6,12 +5,24 @@ use chrono::{Duration, Utc};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::OnceLock;
 use store::module::*;
-use store::store::Store;
 use uuid::Uuid;
 
-const JWT_SECRET: &[u8] = b"super-secret-key"; // TODO: load from env/config
+// JWT signing secret, initialized once from Config at startup (was hardcoded).
+static JWT_SECRET: OnceLock<Vec<u8>> = OnceLock::new();
+
+/// Install the JWT secret. Called once from `main` with `Config::jwt_secret`.
+pub fn set_jwt_secret(secret: String) {
+    let _ = JWT_SECRET.set(secret.into_bytes());
+}
+
+fn jwt_secret() -> &'static [u8] {
+    JWT_SECRET
+        .get()
+        .map(|v| v.as_slice())
+        .expect("JWT secret not initialized (call set_jwt_secret in main)")
+}
 
 // ====== JWT ======
 #[derive(Debug, Serialize, Deserialize)]
@@ -34,7 +45,7 @@ fn generate_jwt(sub: &str) -> String {
     encode(
         &Header::default(),
         &claims,
-        &EncodingKey::from_secret(JWT_SECRET),
+        &EncodingKey::from_secret(jwt_secret()),
     )
     .unwrap()
 }
@@ -42,7 +53,7 @@ fn generate_jwt(sub: &str) -> String {
 pub fn validate_jwt(token: &str) -> Option<Claims> {
     decode::<Claims>(
         token,
-        &DecodingKey::from_secret(JWT_SECRET),
+        &DecodingKey::from_secret(jwt_secret()),
         &Validation::new(Algorithm::HS256),
     )
     .ok()
@@ -127,9 +138,12 @@ pub struct OrderResponse {
 #[post("/merchants/signup")]
 pub async fn sign_up(
     req: web::Json<SignUpRequest>,
-    store: web::Data<Arc<Mutex<Store>>>,
+    pool: web::Data<store::Pool>,
 ) -> impl Responder {
-    let mut store = store.lock().unwrap();
+    let mut conn = match pool.get() {
+        Ok(c) => c,
+        Err(_) => return HttpResponse::InternalServerError().finish(),
+    };
 
     let hashed_pw = hash(&req.password, 4).unwrap();
     let merchant = Merchant {
@@ -140,7 +154,7 @@ pub async fn sign_up(
         created_at: None,
     };
 
-    match store.insert_merchant(merchant) {
+    match store::insert_merchant(&mut conn, merchant) {
         Ok(inserted) => HttpResponse::Ok().json(SignUpResponse {
             merchant_id: inserted.id.to_string(),
             email: inserted.email,
@@ -153,11 +167,14 @@ pub async fn sign_up(
 #[post("/merchants/signin")]
 pub async fn sign_in(
     req: web::Json<SignInRequest>,
-    store: web::Data<Arc<Mutex<Store>>>,
+    pool: web::Data<store::Pool>,
 ) -> impl Responder {
-    let mut store = store.lock().unwrap();
+    let mut conn = match pool.get() {
+        Ok(c) => c,
+        Err(_) => return HttpResponse::InternalServerError().finish(),
+    };
 
-    match store.find_merchant_by_email(&req.email) {
+    match store::find_merchant_by_email(&mut conn, &req.email) {
         Ok(merchant) => {
             if verify(&req.password, &merchant.password_hash).unwrap() {
                 let token = generate_jwt(&merchant.id.to_string());
@@ -171,14 +188,17 @@ pub async fn sign_in(
 }
 
 #[get("/merchants/me")]
-pub async fn get_merchant(req: HttpRequest, store: web::Data<Arc<Mutex<Store>>>) -> impl Responder {
+pub async fn get_merchant(req: HttpRequest, pool: web::Data<store::Pool>) -> impl Responder {
     if let Some(auth_header) = req.headers().get("Authorization") {
         if let Ok(auth_str) = auth_header.to_str() {
             if let Some(token) = auth_str.strip_prefix("Bearer ") {
                 if let Some(claims) = validate_jwt(token) {
-                    let mut store = store.lock().unwrap();
+                    let mut conn = match pool.get() {
+                        Ok(c) => c,
+                        Err(_) => return HttpResponse::InternalServerError().finish(),
+                    };
                     if let Ok(merchant) =
-                        store.find_merchant_by_id(Uuid::parse_str(&claims.sub).unwrap())
+                        store::find_merchant_by_id(&mut conn, Uuid::parse_str(&claims.sub).unwrap())
                     {
                         return HttpResponse::Ok().json(MerchantResponse {
                             merchant_id: merchant.id.to_string(),
@@ -197,13 +217,16 @@ pub async fn get_merchant(req: HttpRequest, store: web::Data<Arc<Mutex<Store>>>)
 pub async fn create_app(
     req: web::Json<CreateAppRequest>,
     http_req: HttpRequest,
-    store: web::Data<Arc<Mutex<Store>>>,
+    pool: web::Data<store::Pool>,
 ) -> impl Responder {
     if let Some(auth_header) = http_req.headers().get("Authorization") {
         if let Ok(auth_str) = auth_header.to_str() {
             if let Some(token) = auth_str.strip_prefix("Bearer ") {
                 if let Some(claims) = validate_jwt(token) {
-                    let mut store = store.lock().unwrap();
+                    let mut conn = match pool.get() {
+                        Ok(c) => c,
+                        Err(_) => return HttpResponse::InternalServerError().finish(),
+                    };
                     let app_id = Uuid::new_v4();
                     let app_token = Uuid::new_v4().to_string();
 
@@ -216,7 +239,7 @@ pub async fn create_app(
                         created_at: None,
                     };
 
-                    match store.insert_app(app) {
+                    match store::insert_app(&mut conn, app) {
                         Ok(inserted) => {
                             return HttpResponse::Ok().json(CreateAppResponse {
                                 app_id: inserted.id.to_string(),
@@ -236,15 +259,18 @@ pub async fn create_app(
 #[get("/apps")]
 pub async fn list_apps(
     http_req: HttpRequest,
-    store: web::Data<Arc<Mutex<Store>>>,
+    pool: web::Data<store::Pool>,
 ) -> impl Responder {
     if let Some(auth_header) = http_req.headers().get("Authorization") {
         if let Ok(auth_str) = auth_header.to_str() {
             if let Some(token) = auth_str.strip_prefix("Bearer ") {
                 if let Some(claims) = validate_jwt(token) {
-                    let mut store = store.lock().unwrap();
+                    let mut conn = match pool.get() {
+                        Ok(c) => c,
+                        Err(_) => return HttpResponse::InternalServerError().finish(),
+                    };
                     if let Ok(apps) =
-                        store.list_apps_by_merchant(Uuid::parse_str(&claims.sub).unwrap())
+                        store::list_apps_by_merchant(&mut conn, Uuid::parse_str(&claims.sub).unwrap())
                     {
                         let response = apps
                             .into_iter()
@@ -266,15 +292,18 @@ pub async fn list_apps(
 pub async fn create_order(
     req: web::Json<CreateOrderRequest>,
     http_req: HttpRequest,
-    store: web::Data<Arc<Mutex<Store>>>,
+    pool: web::Data<store::Pool>,
 ) -> impl Responder {
     if let Some(auth_header) = http_req.headers().get("Authorization") {
         if let Ok(auth_str) = auth_header.to_str() {
             if let Some(app_token) = auth_str.strip_prefix("Token ") {
-                let mut store = store.lock().unwrap();
+                let mut conn = match pool.get() {
+                    Ok(c) => c,
+                    Err(_) => return HttpResponse::InternalServerError().finish(),
+                };
 
                 // Validate app_token
-                match store.find_app_by_token(app_token) {
+                match store::find_app_by_token(&mut conn, app_token) {
                     Ok(app) => {
                         let id = Uuid::new_v4();
                         let memo_id = Uuid::new_v4().to_string();
@@ -307,7 +336,7 @@ pub async fn create_order(
                             confirmed_at: None,
                         };
 
-                        match store.insert_order(order) {
+                        match store::insert_order(&mut conn, order) {
                             Ok(inserted) => {
                                 return HttpResponse::Ok().json(CreateOrderResponse {
                                     id: inserted.id.to_string(),
@@ -334,19 +363,22 @@ pub async fn create_order(
 pub async fn get_order(
     path: web::Path<String>,
     http_req: HttpRequest,
-    store: web::Data<Arc<Mutex<Store>>>,
+    pool: web::Data<store::Pool>,
 ) -> impl Responder {
     if let Some(auth_header) = http_req.headers().get("Authorization") {
         if let Ok(auth_str) = auth_header.to_str() {
             if let Some(app_token) = auth_str.strip_prefix("Token ") {
-                let mut store = store.lock().unwrap();
+                let mut conn = match pool.get() {
+                    Ok(c) => c,
+                    Err(_) => return HttpResponse::InternalServerError().finish(),
+                };
 
                 // Validate app_token
-                match store.find_app_by_token(app_token) {
+                match store::find_app_by_token(&mut conn, app_token) {
                     Ok(app) => {
                         let oid = Uuid::parse_str(&path.into_inner()).unwrap();
 
-                        match store.find_order_by_app(oid, app.id) {
+                        match store::find_order_by_app(&mut conn, oid, app.id) {
                             Ok(order) => {
                                 return HttpResponse::Ok().json(OrderResponse {
                                     id: order.id.to_string(),

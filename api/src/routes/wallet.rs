@@ -2,11 +2,9 @@ use actix_web::{HttpResponse, Responder, post, web};
 use anyhow::{Result, anyhow};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 use store::module::Wallet;
-use store::store::Store;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateWalletResponse {
@@ -15,7 +13,7 @@ pub struct CreateWalletResponse {
 }
 
 #[post("/wallets/fat")]
-pub async fn create_fat_wallet(store: web::Data<Arc<Mutex<Store>>>) -> impl Responder {
+pub async fn create_fat_wallet(pool: web::Data<store::Pool>) -> impl Responder {
     // 1. Call MPC service (mocked here)
     let (wallet_id, pubkey) = match mpc_create_wallet().await {
         Ok(res) => res,
@@ -36,8 +34,11 @@ pub async fn create_fat_wallet(store: web::Data<Arc<Mutex<Store>>>) -> impl Resp
         created_at: Some(chrono::Utc::now().naive_utc()),
     };
 
-    let mut s = store.lock().unwrap();
-    match s.insert_wallet(wallet) {
+    let mut conn = match pool.get() {
+        Ok(c) => c,
+        Err(e) => return HttpResponse::InternalServerError().body(e.to_string()),
+    };
+    match store::insert_wallet(&mut conn, wallet) {
         Ok(w) => HttpResponse::Ok().json(CreateWalletResponse {
             wallet_id: w.id,
             pubkey: w.address,

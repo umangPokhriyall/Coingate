@@ -3,8 +3,6 @@ use actix_web::{HttpRequest, HttpResponse, post, web};
 use bigdecimal::BigDecimal;
 use serde::Deserialize;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
-use store::store::Store;
 use uuid::Uuid;
 
 #[derive(Deserialize)]
@@ -18,7 +16,7 @@ pub struct CreateWithdrawalRequest {
 pub async fn create_withdrawal(
     http_req: HttpRequest,
     body: web::Json<CreateWithdrawalRequest>,
-    store: web::Data<Arc<Mutex<Store>>>,
+    pool: web::Data<store::Pool>,
 ) -> HttpResponse {
     // 1) Merchant verification via Bearer token
     let merchant_id = if let Some(auth_header) = http_req.headers().get("Authorization") {
@@ -48,18 +46,16 @@ pub async fn create_withdrawal(
         Err(_) => return HttpResponse::BadRequest().body("invalid amount"),
     };
 
-    let mut s = match store.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-
-    // 3) Attempt to create withdrawal & lock funds
-    let withdrawal = match s.create_withdrawal_and_lock(
-        merchant_id,
-        &body.token_mint,
-        &amount_bd,
-        &body.target_address,
-    ) {
+    // 3) Attempt to create withdrawal & lock funds (single transaction entry point)
+    let withdrawal = match store::with_tx(&pool, |conn| {
+        store::create_withdrawal_and_lock(
+            conn,
+            merchant_id,
+            &body.token_mint,
+            &amount_bd,
+            &body.target_address,
+        )
+    }) {
         Ok(wd) => wd,
         Err(e) => {
             println!("create_withdrawal_and_lock error: {:?}", e);
@@ -110,7 +106,9 @@ pub async fn create_withdrawal(
         Err(e) => {
             println!("redis push failed: {:?}", e);
             // revert DB lock on failure
-            if let Err(err) = s.revert_withdrawal_lock(merchant_id, &body.token_mint, &amount_bd) {
+            if let Err(err) = store::with_tx(&pool, |conn| {
+                store::revert_withdrawal_lock(conn, merchant_id, &body.token_mint, &amount_bd)
+            }) {
                 println!("failed to revert lock after redis failure: {:?}", err);
             }
             HttpResponse::InternalServerError().body("failed to enqueue withdrawal")

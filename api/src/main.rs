@@ -1,11 +1,10 @@
 use actix_web::middleware::Logger;
 use actix_web::{App, HttpServer, web};
-use std::sync::{Arc, Mutex};
-use store::store::Store;
+use store::{build_pool, Config, Pool};
 
 mod routes;
 use routes::merchant::{
-    create_app, create_order, get_merchant, get_order, list_apps, sign_in, sign_up,
+    create_app, create_order, get_merchant, list_apps, set_jwt_secret, sign_in, sign_up, get_order,
 };
 use routes::payment::{create_payment_tx, get_payment_details, get_payment_status};
 use routes::wallet::create_fat_wallet;
@@ -13,15 +12,22 @@ use routes::withdraw::create_withdrawal;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    // std::env::set_var("RUST_LOG", "actix_web=info");
-    // env_logger::init();
+    // Config is sourced entirely from the environment; fail fast if anything is missing.
+    let cfg = Config::from_env().expect("invalid configuration (check required env vars)");
 
-    let store = Arc::new(Mutex::new(Store::new().expect("DB connection failed")));
+    // One pool for the whole process; shared via web::Data (no Arc<Mutex<Store>>).
+    let pool: Pool = build_pool(&cfg).expect("failed to build database pool");
+    let pool_data = web::Data::new(pool);
+
+    // Hand the JWT signing secret to the auth helpers (was hardcoded).
+    set_jwt_secret(cfg.jwt_secret.clone());
+
+    let listen_addr = cfg.listen_addr.clone();
 
     HttpServer::new(move || {
         App::new().wrap(Logger::default()).service(
             web::scope("/api/v1")
-                .app_data(web::Data::new(store.clone()))
+                .app_data(pool_data.clone())
                 .service(sign_up)
                 .service(create_fat_wallet)
                 .service(get_payment_details)
@@ -36,7 +42,7 @@ async fn main() -> std::io::Result<()> {
                 .service(get_order),
         )
     })
-    .bind(("127.0.0.1", 8080))?
+    .bind(listen_addr)?
     .run()
     .await
 }
