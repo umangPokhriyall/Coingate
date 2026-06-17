@@ -1,4 +1,5 @@
-use actix_web::{HttpResponse, Responder, post, web};
+use crate::error::ApiError;
+use actix_web::{HttpResponse, post, web};
 use anyhow::{Result, anyhow};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -13,15 +14,13 @@ pub struct CreateWalletResponse {
 }
 
 #[post("/wallets/fat")]
-pub async fn create_fat_wallet(pool: web::Data<store::Pool>) -> impl Responder {
+pub async fn create_fat_wallet(pool: web::Data<store::Pool>) -> Result<HttpResponse, ApiError> {
     // 1. Call MPC service (mocked here)
-    let (wallet_id, pubkey) = match mpc_create_wallet().await {
-        Ok(res) => res,
-        Err(e) => return HttpResponse::InternalServerError().body(e.to_string()),
-    };
+    let (wallet_id, pubkey) = mpc_create_wallet()
+        .await
+        .map_err(|e| ApiError::Internal(format!("mpc create wallet: {e}")))?;
 
     // 2. Insert into DB
-
     let wallet = Wallet {
         id: wallet_id,
         name: Some("Fat Wallet".into()),
@@ -34,17 +33,13 @@ pub async fn create_fat_wallet(pool: web::Data<store::Pool>) -> impl Responder {
         created_at: Some(chrono::Utc::now().naive_utc()),
     };
 
-    let mut conn = match pool.get() {
-        Ok(c) => c,
-        Err(e) => return HttpResponse::InternalServerError().body(e.to_string()),
-    };
-    match store::insert_wallet(&mut conn, wallet) {
-        Ok(w) => HttpResponse::Ok().json(CreateWalletResponse {
-            wallet_id: w.id,
-            pubkey: w.address,
-        }),
-        Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
-    }
+    let mut conn = store::get_conn(&pool)?;
+    let w = store::insert_wallet(&mut conn, wallet)
+        .map_err(|e| ApiError::Internal(format!("insert wallet: {e}")))?;
+    Ok(HttpResponse::Ok().json(CreateWalletResponse {
+        wallet_id: w.id,
+        pubkey: w.address,
+    }))
 }
 
 #[derive(Deserialize)]

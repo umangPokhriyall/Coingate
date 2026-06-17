@@ -1,9 +1,9 @@
-use crate::routes::merchant::validate_jwt; // reuse your existing JWT validation
+use crate::error::ApiError;
+use crate::routes::merchant::{bearer_claims, merchant_uuid};
 use actix_web::{HttpRequest, HttpResponse, post, web};
 use bigdecimal::BigDecimal;
 use serde::Deserialize;
 use std::str::FromStr;
-use uuid::Uuid;
 
 #[derive(Deserialize)]
 pub struct CreateWithdrawalRequest {
@@ -17,37 +17,18 @@ pub async fn create_withdrawal(
     http_req: HttpRequest,
     body: web::Json<CreateWithdrawalRequest>,
     pool: web::Data<store::Pool>,
-) -> HttpResponse {
+) -> Result<HttpResponse, ApiError> {
     // 1) Merchant verification via Bearer token
-    let merchant_id = if let Some(auth_header) = http_req.headers().get("Authorization") {
-        if let Ok(auth_str) = auth_header.to_str() {
-            if let Some(token) = auth_str.strip_prefix("Bearer ") {
-                if let Some(claims) = validate_jwt(token) {
-                    match Uuid::parse_str(&claims.sub) {
-                        Ok(uuid) => uuid,
-                        Err(_) => return HttpResponse::Unauthorized().body("invalid merchant id"),
-                    }
-                } else {
-                    return HttpResponse::Unauthorized().body("invalid token");
-                }
-            } else {
-                return HttpResponse::Unauthorized().body("expected Bearer token");
-            }
-        } else {
-            return HttpResponse::Unauthorized().finish();
-        }
-    } else {
-        return HttpResponse::Unauthorized().finish();
-    };
+    let claims = bearer_claims(&http_req)?;
+    let merchant_id = merchant_uuid(&claims)?;
 
-    // 2) Parse amount
-    let amount_bd = match BigDecimal::from_str(&body.amount) {
-        Ok(v) => v,
-        Err(_) => return HttpResponse::BadRequest().body("invalid amount"),
-    };
+    // 2) Parse amount (exact decimal; never f64). Withdrawal unit semantics unchanged.
+    let amount_bd = BigDecimal::from_str(&body.amount)
+        .map_err(|_| ApiError::BadRequest("invalid amount".into()))?;
 
-    // 3) Attempt to create withdrawal & lock funds (single transaction entry point)
-    let withdrawal = match store::with_tx(&pool, |conn| {
+    // 3) Create withdrawal & lock funds (single transaction entry point). A failure here is
+    // insufficient funds or a DB error; both surface to the client as a 400, as before.
+    let withdrawal = store::with_tx(&pool, |conn| {
         store::create_withdrawal_and_lock(
             conn,
             merchant_id,
@@ -55,30 +36,18 @@ pub async fn create_withdrawal(
             &amount_bd,
             &body.target_address,
         )
-    }) {
-        Ok(wd) => wd,
-        Err(e) => {
-            println!("create_withdrawal_and_lock error: {:?}", e);
-            return HttpResponse::BadRequest().body("insufficient balance or DB error");
-        }
-    };
+    })
+    .map_err(|e| {
+        tracing::warn!(error = %e, %merchant_id, "create_withdrawal_and_lock failed");
+        ApiError::BadRequest("insufficient balance or DB error".into())
+    })?;
 
     // 4) Push to Redis stream
-    let client = match redis::Client::open("redis://127.0.0.1:6379") {
-        Ok(c) => c,
-        Err(e) => {
-            return HttpResponse::InternalServerError()
-                .body(format!("Redis client error: {:?}", e));
-        }
-    };
-
-    let mut conn = match client.get_connection() {
-        Ok(c) => c,
-        Err(e) => {
-            return HttpResponse::InternalServerError()
-                .body(format!("Redis connection error: {:?}", e));
-        }
-    };
+    let client = redis::Client::open("redis://127.0.0.1:6379")
+        .map_err(|e| ApiError::Internal(format!("redis client: {e}")))?;
+    let mut conn = client
+        .get_connection()
+        .map_err(|e| ApiError::Internal(format!("redis connection: {e}")))?;
 
     let payload = serde_json::json!({
         "withdrawal_id": withdrawal.id.to_string(),
@@ -89,7 +58,7 @@ pub async fn create_withdrawal(
         "created_at": chrono::Utc::now().to_rfc3339(),
     });
 
-    println!("📤 Enqueuing withdrawal payload to Redis: {}", payload);
+    tracing::info!(withdrawal_id = %withdrawal.id, "enqueuing withdrawal to redis");
 
     let res: redis::RedisResult<String> = redis::cmd("XADD")
         .arg("withdrawal_requests")
@@ -99,19 +68,19 @@ pub async fn create_withdrawal(
         .query(&mut conn);
 
     match res {
-        Ok(_id) => HttpResponse::Ok().json(serde_json::json!({
+        Ok(_id) => Ok(HttpResponse::Ok().json(serde_json::json!({
             "withdrawal_id": withdrawal.id,
             "status": "pending"
-        })),
+        }))),
         Err(e) => {
-            println!("redis push failed: {:?}", e);
+            tracing::error!(error = %e, withdrawal_id = %withdrawal.id, "redis push failed");
             // revert DB lock on failure
             if let Err(err) = store::with_tx(&pool, |conn| {
                 store::revert_withdrawal_lock(conn, merchant_id, &body.token_mint, &amount_bd)
             }) {
-                println!("failed to revert lock after redis failure: {:?}", err);
+                tracing::error!(error = %err, "failed to revert lock after redis failure");
             }
-            HttpResponse::InternalServerError().body("failed to enqueue withdrawal")
+            Err(ApiError::Internal("failed to enqueue withdrawal".into()))
         }
     }
 }

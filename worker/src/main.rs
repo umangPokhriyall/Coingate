@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use bigdecimal::{BigDecimal, ToPrimitive};
 use redis::Value as RedisValue;
 use reqwest::Client;
@@ -6,6 +6,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::str::FromStr;
 use store::{Config, Pool, build_pool, get_conn, with_tx};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -69,45 +70,54 @@ fn parse_xreadgroup_response(v: RedisValue) -> Vec<(String, String, String)> {
     out
 }
 
+/// Read a required string field, returning a typed error instead of panicking on a
+/// malformed/missing field (the whole point: a bad stream entry must dead-letter, not abort).
+fn req_str<'a>(json: &'a Value, key: &str) -> Result<&'a str> {
+    json[key]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing or non-string field '{key}'"))
+}
+
 fn parse_withdrawal_payload(data_str: &str) -> Result<WithdrawalPayload> {
-    println!("🔎 Raw withdrawal payload: {}", data_str);
+    debug!(raw = %data_str, "raw withdrawal payload");
     let wrapper: Value = serde_json::from_str(data_str)?;
 
-    // unwrap "data" field
     let inner_str = wrapper["data"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("missing 'data' field in payload"))?;
 
-    println!("🔍 Inner withdrawal payload: {}", inner_str);
-
     let json: Value = serde_json::from_str(inner_str)?;
 
+    // Exact money only: an amount string parses to BigDecimal; an integer is taken exactly.
+    // f64 is rejected outright (no float round-trips on money).
     let amount = match &json["amount"] {
         Value::String(s) => BigDecimal::from_str(s)?,
-        Value::Number(n) => {
-            if let Some(u) = n.as_u64() {
-                BigDecimal::from(u)
-            } else if let Some(f) = n.as_f64() {
-                BigDecimal::from_str(&f.to_string())?
-            } else {
-                return Err(anyhow::anyhow!("invalid amount format"));
-            }
-        }
+        Value::Number(n) => match n.as_u64() {
+            Some(u) => BigDecimal::from(u),
+            None => return Err(anyhow::anyhow!("amount must be an integer or a decimal string")),
+        },
         _ => return Err(anyhow::anyhow!("amount missing")),
     };
 
     Ok(WithdrawalPayload {
-        withdrawal_id: Uuid::parse_str(json["withdrawal_id"].as_str().unwrap())?,
-        merchant_id: Uuid::parse_str(json["merchant_id"].as_str().unwrap())?,
-        token_mint: json["token_mint"].as_str().unwrap().to_string(),
+        withdrawal_id: Uuid::parse_str(req_str(&json, "withdrawal_id")?)?,
+        merchant_id: Uuid::parse_str(req_str(&json, "merchant_id")?)?,
+        token_mint: req_str(&json, "token_mint")?.to_string(),
         amount,
-        target_address: json["target_address"].as_str().unwrap().to_string(),
-        created_at: json["created_at"].as_str().unwrap().to_string(),
+        target_address: req_str(&json, "target_address")?.to_string(),
+        created_at: req_str(&json, "created_at")?.to_string(),
     })
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
     let cfg = Config::from_env().expect("invalid configuration (check required env vars)");
     let client = redis::Client::open(cfg.redis_url.clone())?;
     let mut conn = client.get_connection()?;
@@ -136,9 +146,12 @@ async fn main() -> Result<()> {
             .query(&mut conn)?;
 
         for (stream, redis_id, data_str) in parse_xreadgroup_response(xauto) {
-            if let Ok(payload) = parse_withdrawal_payload(&data_str) {
-                process_withdrawal(&pool, &payload, &mut conn, group, &stream, &redis_id)
-                    .await?;
+            match parse_withdrawal_payload(&data_str) {
+                Ok(payload) => {
+                    process_withdrawal(&pool, &payload, &mut conn, group, &stream, &redis_id)
+                        .await?;
+                }
+                Err(e) => warn!(error = %e, %stream, %redis_id, "malformed withdrawal payload, skipping"),
             }
         }
 
@@ -156,9 +169,12 @@ async fn main() -> Result<()> {
             .query(&mut conn)?;
 
         for (stream, redis_id, data_str) in parse_xreadgroup_response(xread) {
-            if let Ok(payload) = parse_withdrawal_payload(&data_str) {
-                process_withdrawal(&pool, &payload, &mut conn, group, &stream, &redis_id)
-                    .await?;
+            match parse_withdrawal_payload(&data_str) {
+                Ok(payload) => {
+                    process_withdrawal(&pool, &payload, &mut conn, group, &stream, &redis_id)
+                        .await?;
+                }
+                Err(e) => warn!(error = %e, %stream, %redis_id, "malformed withdrawal payload, skipping"),
             }
         }
     }
@@ -174,22 +190,19 @@ async fn process_withdrawal(
 ) -> Result<()> {
     let withdrawal_id = payload.withdrawal_id;
 
-    println!(
-        "📌 Processing withdrawal {} from stream {} (Redis ID: {})",
-        withdrawal_id, stream, redis_id
-    );
+    info!(%withdrawal_id, %stream, %redis_id, "processing withdrawal");
 
     // Pooled connection for the pre-send, single-statement DB work.
     let mut db = get_conn(pool)?;
 
     // Update status to 'processing'
     let _ = store::update_withdrawal_status(&mut db, withdrawal_id, "processing", None)?;
-    println!("⏳ Withdrawal {} status set to 'processing'", withdrawal_id);
+    debug!(%withdrawal_id, "withdrawal status set to 'processing'");
 
     // Get the fat wallet
     let fat_wallet = store::get_fat_wallet(&mut db)?;
     let mpc_url = format!("http://127.0.0.1:3000/wallets/{}/send", fat_wallet.id);
-    println!("📡 Sending request to MPC at {}", mpc_url);
+    debug!(%mpc_url, "sending request to MPC");
 
     // Determine if token or SOL
     let is_sol = payload.token_mint == "So11111111111111111111111111111111111111112";
@@ -217,8 +230,7 @@ async fn process_withdrawal(
     // Done with pooled DB connection before the MPC network call.
     drop(db);
 
-    println!("💰 Original payload amount: {}", payload.amount);
-    println!("💰 Converted to u64 smallest unit: {}", amount_u64);
+    debug!(amount = %payload.amount, amount_base_units = amount_u64, "converted withdrawal amount");
 
     // Build request body for MPC
     let req_body = if mint_param.is_some() {
@@ -235,7 +247,7 @@ async fn process_withdrawal(
         })
     };
 
-    println!("📤 MPC request body: {}", req_body);
+    debug!(%req_body, "MPC request body");
 
     // Send request
     let cli = Client::new();
@@ -250,10 +262,7 @@ async fn process_withdrawal(
                         .arg(group)
                         .arg(redis_id)
                         .query(conn)?;
-                    println!(
-                        "✅ Withdrawal {} completed successfully. TxSig={}",
-                        withdrawal_id, sig
-                    );
+                    info!(%withdrawal_id, %sig, "withdrawal completed successfully");
                 } else {
                     with_tx(pool, |c| {
                         store::finalize_withdrawal_failed(c, withdrawal_id, "mpc_no_sig")
@@ -263,10 +272,7 @@ async fn process_withdrawal(
                         .arg(group)
                         .arg(redis_id)
                         .query(conn)?;
-                    println!(
-                        "❌ Withdrawal {} failed: no signature returned",
-                        withdrawal_id
-                    );
+                    warn!(%withdrawal_id, "withdrawal failed: no signature returned");
                 }
             } else {
                 let body = r.text().await.unwrap_or_default();
@@ -278,19 +284,74 @@ async fn process_withdrawal(
                     .arg(group)
                     .arg(redis_id)
                     .query(conn)?;
-                println!(
-                    "❌ Withdrawal {} failed: MPC error: {}",
-                    withdrawal_id, body
-                );
+                warn!(%withdrawal_id, %body, "withdrawal failed: MPC error");
             }
         }
         Err(e) => {
-            println!(
-                "🌐 Network error calling MPC for withdrawal {}: {:?}",
-                withdrawal_id, e
-            );
+            error!(%withdrawal_id, error = %e, "network error calling MPC");
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wrap(inner: serde_json::Value) -> String {
+        // Stream payloads arrive as {"data": "<inner json string>"}.
+        serde_json::json!({ "data": inner.to_string() }).to_string()
+    }
+
+    fn valid_inner() -> serde_json::Value {
+        serde_json::json!({
+            "withdrawal_id": uuid::Uuid::new_v4().to_string(),
+            "merchant_id": uuid::Uuid::new_v4().to_string(),
+            "token_mint": "So11111111111111111111111111111111111111112",
+            "amount": "1.5",
+            "target_address": "addr",
+            "created_at": "2026-01-01T00:00:00Z",
+        })
+    }
+
+    #[test]
+    fn valid_payload_parses() {
+        assert!(parse_withdrawal_payload(&wrap(valid_inner())).is_ok());
+    }
+
+    #[test]
+    fn hostile_payloads_error_and_never_panic() {
+        // Each of these must return Err (dead-letter), never panic.
+        let cases: Vec<String> = vec![
+            "not json at all".to_string(),
+            "".to_string(),
+            "{}".to_string(),
+            serde_json::json!({ "data": 123 }).to_string(), // data not a string
+            serde_json::json!({ "data": "still not json" }).to_string(),
+            wrap(serde_json::json!({ "merchant_id": "x" })), // missing fields
+            wrap(serde_json::json!({
+                "withdrawal_id": "not-a-uuid",
+                "merchant_id": uuid::Uuid::new_v4().to_string(),
+                "token_mint": "m", "amount": "1", "target_address": "a", "created_at": "t"
+            })),
+            // float amount must be rejected (no f64 on money)
+            wrap(serde_json::json!({
+                "withdrawal_id": uuid::Uuid::new_v4().to_string(),
+                "merchant_id": uuid::Uuid::new_v4().to_string(),
+                "token_mint": "m", "amount": 1.5, "target_address": "a", "created_at": "t"
+            })),
+            // amount as a wrong type
+            wrap(serde_json::json!({
+                "withdrawal_id": uuid::Uuid::new_v4().to_string(),
+                "merchant_id": uuid::Uuid::new_v4().to_string(),
+                "token_mint": "m", "amount": ["x"], "target_address": "a", "created_at": "t"
+            })),
+        ];
+
+        for raw in cases {
+            let result = parse_withdrawal_payload(&raw);
+            assert!(result.is_err(), "expected Err for hostile input: {raw}");
+        }
+    }
 }

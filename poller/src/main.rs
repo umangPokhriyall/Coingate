@@ -11,6 +11,7 @@ use solana_transaction_status::{
 use std::str::FromStr;
 use store::{Config, build_pool, get_conn};
 use tokio::time::{Duration, sleep};
+use tracing::{debug, info, warn};
 
 #[derive(Debug)]
 struct TransactionData {
@@ -30,6 +31,13 @@ struct TransactionData {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
     let cfg = Config::from_env().expect("invalid configuration (check required env vars)");
 
     // Connect Redis
@@ -42,7 +50,7 @@ async fn main() -> Result<()> {
     let fat_wallet = store::get_fat_wallet(&mut db_conn).expect("fat wallet not configured");
     let fat_pubkey = Pubkey::from_str(&fat_wallet.address).expect("invalid pubkey");
 
-    println!("🔑 Polling for wallet: {}", fat_pubkey);
+    info!(wallet = %fat_pubkey, "polling for wallet");
 
     // Solana client
     let rpc = RpcClient::new_with_commitment(
@@ -55,7 +63,7 @@ async fn main() -> Result<()> {
 
     // If no checkpoint exists, get the most recent transaction as starting point
     if last_processed_sig.is_none() {
-        println!("🚀 No checkpoint found, getting latest transaction as starting point...");
+        info!("no checkpoint found, using latest transaction as starting point");
         let latest_sigs = rpc
             .get_signatures_for_address_with_config(
                 &fat_pubkey,
@@ -71,7 +79,7 @@ async fn main() -> Result<()> {
         if let Some(latest_sig) = latest_sigs.first() {
             last_processed_sig = Some(latest_sig.signature.clone());
             let _: () = redis_conn.set("poller:last_sig", &latest_sig.signature)?;
-            println!("📍 Set checkpoint to: {}", latest_sig.signature);
+            info!(checkpoint = %latest_sig.signature, "set initial checkpoint");
         }
     }
 
@@ -92,20 +100,20 @@ async fn main() -> Result<()> {
             .await?;
 
         if sigs.is_empty() {
-            println!("😴 No new transactions, sleeping...");
+            debug!("no new transactions, sleeping");
             sleep(Duration::from_secs(5)).await;
             continue;
         }
 
-        println!("📜 Found {} NEW signatures", sigs.len());
+        info!(count = sigs.len(), "found new signatures");
 
         // Process transactions in reverse order (oldest first among the new ones)
         // This ensures we process them in chronological order
         for s in sigs.iter().rev() {
-            println!("➡️ Processing sig: {}", s.signature);
+            debug!(signature = %s.signature, "processing signature");
 
             let Ok(signature) = s.signature.parse::<Signature>() else {
-                println!("   ❌ Invalid signature format, skipping");
+                warn!(signature = %s.signature, "invalid signature format, skipping");
                 continue;
             };
 
@@ -113,13 +121,13 @@ async fn main() -> Result<()> {
                 .get_transaction(&signature, UiTransactionEncoding::Json)
                 .await
             else {
-                println!("   ❌ Failed to fetch transaction, skipping");
+                warn!(signature = %s.signature, "failed to fetch transaction, skipping");
                 continue;
             };
 
             if let Some(meta) = &tx.transaction.meta {
                 if meta.err.is_some() {
-                    println!("   ❌ Failed tx, skipping");
+                    debug!(signature = %s.signature, "failed tx, skipping");
                     continue;
                 }
 
@@ -145,11 +153,9 @@ async fn main() -> Result<()> {
                         if log.starts_with("Program log: Memo (len") {
                             if let (Some(start), Some(end)) = (log.find('"'), log.rfind('"')) {
                                 if start < end {
-                                    tx_data.memo_id = Some(log[start + 1..end].to_string());
-                                    println!(
-                                        "   📝 Found memo: {}",
-                                        tx_data.memo_id.as_ref().unwrap()
-                                    );
+                                    let memo = log[start + 1..end].to_string();
+                                    debug!(%memo, "found memo");
+                                    tx_data.memo_id = Some(memo);
                                 }
                             }
                         }
@@ -157,7 +163,7 @@ async fn main() -> Result<()> {
                 }
 
                 if tx_data.memo_id.is_none() {
-                    println!("   ⚠️ No memo found, skipping");
+                    debug!(signature = %s.signature, "no memo found, skipping");
                     continue;
                 }
 
@@ -188,11 +194,14 @@ async fn main() -> Result<()> {
                             &tx_data.token_decimals.unwrap_or(0).to_string(),
                         ),
                         ("status", tx_data.status.as_str()),
-                        ("logs", &serde_json::to_string(&tx_data.logs).unwrap()),
+                        (
+                            "logs",
+                            &serde_json::to_string(&tx_data.logs).unwrap_or_else(|_| "[]".to_string()),
+                        ),
                     ],
                 )?;
 
-                println!("   ✅ Added tx to Redis stream: {:?}", tx_data);
+                info!(signature = %tx_data.signature, "added tx to redis stream");
             }
 
             // Update checkpoint after each successful processing
@@ -200,7 +209,7 @@ async fn main() -> Result<()> {
             let _: () = redis_conn.set("poller:last_sig", &s.signature)?;
         }
 
-        println!("🔄 Updated checkpoint to: {:?}", last_processed_sig);
+        debug!(checkpoint = ?last_processed_sig, "updated checkpoint");
         sleep(Duration::from_secs(3)).await;
     }
 }

@@ -1,11 +1,12 @@
 use anyhow::{Result, anyhow};
 use bigdecimal::{BigDecimal, ToPrimitive};
-use chrono::{NaiveDateTime, Utc};
+use chrono::Utc;
 use redis::Value as RedisValue;
 use serde_json::Value;
 use std::collections::HashMap;
 use store::module::Deposit;
 use store::{Config, PgConnection, build_pool, get_conn};
+use tracing::{error, info, warn};
 
 #[derive(Debug, Clone)]
 struct StreamTransaction {
@@ -175,7 +176,7 @@ async fn process_transaction(conn: &mut PgConnection, tx: &StreamTransaction) ->
         if let Some(app_id) = order.app_id {
             let merchant_id = store::get_merchant_id_for_app(conn, app_id)?;
             store::upsert_balance(conn, merchant_id, &token_mint, &deposit_amount)?;
-            println!("✅ Updated balance for merchant {}", merchant_id);
+            info!(%merchant_id, "updated merchant balance");
         }
 
         Ok(true)
@@ -223,6 +224,13 @@ fn verify_token_transaction(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
     let cfg = Config::from_env().expect("invalid configuration (check required env vars)");
     let client = redis::Client::open(cfg.redis_url.clone())?;
     let mut conn = client.get_connection()?;
@@ -240,7 +248,7 @@ async fn main() -> Result<()> {
         .arg("MKSTREAM")
         .query::<()>(&mut conn)
     {
-        Ok(_) => println!("✅ Created consumer group '{}'", group),
+        Ok(_) => info!(%group, "created consumer group"),
         Err(e) if e.to_string().contains("BUSYGROUP") => {}
         Err(e) => return Err(anyhow!(e)),
     }
@@ -270,9 +278,12 @@ async fn main() -> Result<()> {
                             .arg(&id)
                             .query(&mut conn)?;
                     }
-                    Err(e) => println!("❌ Processing error: {}", e),
+                    Err(e) => error!(error = %e, %id, "processing error"),
                 },
                 Err(e) => {
+                    // Malformed stream entry: ack it so it doesn't poison the loop
+                    // (Phase 0 dead-letter intent; the dead_letter table lands in 0.4).
+                    warn!(error = %e, %stream, %id, "malformed stream entry, acking");
                     let _: () = redis::cmd("XACK")
                         .arg(&stream)
                         .arg(group)
@@ -303,9 +314,12 @@ async fn main() -> Result<()> {
                             .arg(&id)
                             .query(&mut conn)?;
                     }
-                    Err(e) => println!("❌ Processing error: {}", e),
+                    Err(e) => error!(error = %e, %id, "processing error"),
                 },
                 Err(e) => {
+                    // Malformed stream entry: ack it so it doesn't poison the loop
+                    // (Phase 0 dead-letter intent; the dead_letter table lands in 0.4).
+                    warn!(error = %e, %stream, %id, "malformed stream entry, acking");
                     let _: () = redis::cmd("XACK")
                         .arg(&stream)
                         .arg(group)

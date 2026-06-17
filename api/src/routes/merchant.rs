@@ -1,13 +1,15 @@
-use actix_web::{HttpRequest, HttpResponse, Responder, get, post, web};
+use crate::error::ApiError;
+use actix_web::{HttpRequest, HttpResponse, get, post, web};
 use bcrypt::{hash, verify};
-use bigdecimal::BigDecimal;
 use chrono::{Duration, Utc};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
-use std::str::FromStr;
-use std::sync::OnceLock;
 use store::module::*;
+use std::sync::OnceLock;
 use uuid::Uuid;
+
+// USDC settlement precision (6 decimals). Orders are stored in integer base units.
+const USDC_DECIMALS: u32 = 6;
 
 // JWT signing secret, initialized once from Config at startup (was hardcoded).
 static JWT_SECRET: OnceLock<Vec<u8>> = OnceLock::new();
@@ -31,10 +33,10 @@ pub struct Claims {
     pub exp: usize,
 }
 
-fn generate_jwt(sub: &str) -> String {
+fn generate_jwt(sub: &str) -> Result<String, ApiError> {
     let expiration = Utc::now()
         .checked_add_signed(Duration::hours(24))
-        .unwrap()
+        .ok_or_else(|| ApiError::Internal("token expiry overflow".into()))?
         .timestamp();
 
     let claims = Claims {
@@ -47,7 +49,7 @@ fn generate_jwt(sub: &str) -> String {
         &claims,
         &EncodingKey::from_secret(jwt_secret()),
     )
-    .unwrap()
+    .map_err(|e| ApiError::Internal(format!("jwt encode: {e}")))
 }
 
 pub fn validate_jwt(token: &str) -> Option<Claims> {
@@ -58,6 +60,25 @@ pub fn validate_jwt(token: &str) -> Option<Claims> {
     )
     .ok()
     .map(|data| data.claims)
+}
+
+// ====== Auth header helpers (return typed errors, never panic) ======
+pub fn bearer_claims(req: &HttpRequest) -> Result<Claims, ApiError> {
+    let header = req.headers().get("Authorization").ok_or(ApiError::Unauthorized)?;
+    let value = header.to_str().map_err(|_| ApiError::Unauthorized)?;
+    let token = value.strip_prefix("Bearer ").ok_or(ApiError::Unauthorized)?;
+    validate_jwt(token).ok_or(ApiError::Unauthorized)
+}
+
+fn app_token_from(req: &HttpRequest) -> Result<String, ApiError> {
+    let header = req.headers().get("Authorization").ok_or(ApiError::Unauthorized)?;
+    let value = header.to_str().map_err(|_| ApiError::Unauthorized)?;
+    let token = value.strip_prefix("Token ").ok_or(ApiError::Unauthorized)?;
+    Ok(token.to_string())
+}
+
+pub fn merchant_uuid(claims: &Claims) -> Result<Uuid, ApiError> {
+    Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized)
 }
 
 // ====== Requests/Responses ======
@@ -110,7 +131,8 @@ pub struct AppListResponse {
 #[derive(Debug, Deserialize)]
 pub struct CreateOrderRequest {
     pub order_id: String,
-    pub price_amount: f64,
+    // Exact money: a decimal **string** (e.g. "1.50"), never an f64.
+    pub price_amount: String,
     pub price_currency: String,
     pub receive_currency: String,
     pub callback_url: Option<String>,
@@ -123,14 +145,16 @@ pub struct CreateOrderResponse {
     pub payment_url: String,
     pub memo_id: String,
     pub status: String,
-    pub amount: f64,
+    // Echoed back as the original decimal string (no f64).
+    pub amount: String,
     pub receive_currency: String,
 }
 #[derive(Debug, Serialize)]
 pub struct OrderResponse {
     pub id: String,
     pub status: String,
-    pub amount: f64,
+    // Stored base units as a string (no f64).
+    pub amount: String,
     pub receive_currency: String,
 }
 
@@ -139,13 +163,10 @@ pub struct OrderResponse {
 pub async fn sign_up(
     req: web::Json<SignUpRequest>,
     pool: web::Data<store::Pool>,
-) -> impl Responder {
-    let mut conn = match pool.get() {
-        Ok(c) => c,
-        Err(_) => return HttpResponse::InternalServerError().finish(),
-    };
+) -> Result<HttpResponse, ApiError> {
+    let mut conn = store::get_conn(&pool)?;
 
-    let hashed_pw = hash(&req.password, 4).unwrap();
+    let hashed_pw = hash(&req.password, 4).map_err(|e| ApiError::Internal(format!("bcrypt: {e}")))?;
     let merchant = Merchant {
         id: Uuid::new_v4(),
         email: req.email.clone(),
@@ -154,63 +175,51 @@ pub async fn sign_up(
         created_at: None,
     };
 
-    match store::insert_merchant(&mut conn, merchant) {
-        Ok(inserted) => HttpResponse::Ok().json(SignUpResponse {
-            merchant_id: inserted.id.to_string(),
-            email: inserted.email,
-            name: inserted.name,
-        }),
-        Err(_) => HttpResponse::InternalServerError().finish(),
-    }
+    let inserted = store::insert_merchant(&mut conn, merchant)
+        .map_err(|e| ApiError::Internal(format!("insert merchant: {e}")))?;
+    Ok(HttpResponse::Ok().json(SignUpResponse {
+        merchant_id: inserted.id.to_string(),
+        email: inserted.email,
+        name: inserted.name,
+    }))
 }
 
 #[post("/merchants/signin")]
 pub async fn sign_in(
     req: web::Json<SignInRequest>,
     pool: web::Data<store::Pool>,
-) -> impl Responder {
-    let mut conn = match pool.get() {
-        Ok(c) => c,
-        Err(_) => return HttpResponse::InternalServerError().finish(),
-    };
+) -> Result<HttpResponse, ApiError> {
+    let mut conn = store::get_conn(&pool)?;
 
-    match store::find_merchant_by_email(&mut conn, &req.email) {
-        Ok(merchant) => {
-            if verify(&req.password, &merchant.password_hash).unwrap() {
-                let token = generate_jwt(&merchant.id.to_string());
-                HttpResponse::Ok().json(SignInResponse { token })
-            } else {
-                HttpResponse::Unauthorized().finish()
-            }
-        }
-        Err(_) => HttpResponse::Unauthorized().finish(),
+    let merchant =
+        store::find_merchant_by_email(&mut conn, &req.email).map_err(|_| ApiError::Unauthorized)?;
+
+    let ok = verify(&req.password, &merchant.password_hash)
+        .map_err(|e| ApiError::Internal(format!("bcrypt: {e}")))?;
+    if !ok {
+        return Err(ApiError::Unauthorized);
     }
+
+    let token = generate_jwt(&merchant.id.to_string())?;
+    Ok(HttpResponse::Ok().json(SignInResponse { token }))
 }
 
 #[get("/merchants/me")]
-pub async fn get_merchant(req: HttpRequest, pool: web::Data<store::Pool>) -> impl Responder {
-    if let Some(auth_header) = req.headers().get("Authorization") {
-        if let Ok(auth_str) = auth_header.to_str() {
-            if let Some(token) = auth_str.strip_prefix("Bearer ") {
-                if let Some(claims) = validate_jwt(token) {
-                    let mut conn = match pool.get() {
-                        Ok(c) => c,
-                        Err(_) => return HttpResponse::InternalServerError().finish(),
-                    };
-                    if let Ok(merchant) =
-                        store::find_merchant_by_id(&mut conn, Uuid::parse_str(&claims.sub).unwrap())
-                    {
-                        return HttpResponse::Ok().json(MerchantResponse {
-                            merchant_id: merchant.id.to_string(),
-                            email: merchant.email,
-                            name: merchant.name,
-                        });
-                    }
-                }
-            }
-        }
-    }
-    HttpResponse::Unauthorized().finish()
+pub async fn get_merchant(
+    req: HttpRequest,
+    pool: web::Data<store::Pool>,
+) -> Result<HttpResponse, ApiError> {
+    let claims = bearer_claims(&req)?;
+    let merchant_id = merchant_uuid(&claims)?;
+    let mut conn = store::get_conn(&pool)?;
+
+    let merchant =
+        store::find_merchant_by_id(&mut conn, merchant_id).map_err(|_| ApiError::NotFound)?;
+    Ok(HttpResponse::Ok().json(MerchantResponse {
+        merchant_id: merchant.id.to_string(),
+        email: merchant.email,
+        name: merchant.name,
+    }))
 }
 
 #[post("/apps")]
@@ -218,145 +227,107 @@ pub async fn create_app(
     req: web::Json<CreateAppRequest>,
     http_req: HttpRequest,
     pool: web::Data<store::Pool>,
-) -> impl Responder {
-    if let Some(auth_header) = http_req.headers().get("Authorization") {
-        if let Ok(auth_str) = auth_header.to_str() {
-            if let Some(token) = auth_str.strip_prefix("Bearer ") {
-                if let Some(claims) = validate_jwt(token) {
-                    let mut conn = match pool.get() {
-                        Ok(c) => c,
-                        Err(_) => return HttpResponse::InternalServerError().finish(),
-                    };
-                    let app_id = Uuid::new_v4();
-                    let app_token = Uuid::new_v4().to_string();
+) -> Result<HttpResponse, ApiError> {
+    let claims = bearer_claims(&http_req)?;
+    let merchant_id = merchant_uuid(&claims)?;
+    let mut conn = store::get_conn(&pool)?;
 
-                    let app = App {
-                        id: app_id,
-                        merchant_id: Some(Uuid::parse_str(&claims.sub).unwrap()),
-                        title: req.title.clone(),
-                        callback_url: req.callback_url.clone(),
-                        token_hash: hash(&app_token, 4).unwrap(),
-                        created_at: None,
-                    };
+    let app_id = Uuid::new_v4();
+    // Token format: "<app_id>.<secret>". The app_id is the indexed lookup id used by
+    // find_app_by_token; the secret part is what bcrypt protects.
+    let app_token = format!("{}.{}", app_id, Uuid::new_v4());
+    let token_hash =
+        hash(&app_token, 4).map_err(|e| ApiError::Internal(format!("bcrypt: {e}")))?;
 
-                    match store::insert_app(&mut conn, app) {
-                        Ok(inserted) => {
-                            return HttpResponse::Ok().json(CreateAppResponse {
-                                app_id: inserted.id.to_string(),
-                                app_token,
-                                title: inserted.title,
-                            });
-                        }
-                        Err(_) => return HttpResponse::InternalServerError().finish(),
-                    }
-                }
-            }
-        }
-    }
-    HttpResponse::Unauthorized().finish()
+    let app = App {
+        id: app_id,
+        merchant_id: Some(merchant_id),
+        title: req.title.clone(),
+        callback_url: req.callback_url.clone(),
+        token_hash,
+        created_at: None,
+    };
+
+    let inserted = store::insert_app(&mut conn, app)
+        .map_err(|e| ApiError::Internal(format!("insert app: {e}")))?;
+    Ok(HttpResponse::Ok().json(CreateAppResponse {
+        app_id: inserted.id.to_string(),
+        app_token,
+        title: inserted.title,
+    }))
 }
 
 #[get("/apps")]
 pub async fn list_apps(
     http_req: HttpRequest,
     pool: web::Data<store::Pool>,
-) -> impl Responder {
-    if let Some(auth_header) = http_req.headers().get("Authorization") {
-        if let Ok(auth_str) = auth_header.to_str() {
-            if let Some(token) = auth_str.strip_prefix("Bearer ") {
-                if let Some(claims) = validate_jwt(token) {
-                    let mut conn = match pool.get() {
-                        Ok(c) => c,
-                        Err(_) => return HttpResponse::InternalServerError().finish(),
-                    };
-                    if let Ok(apps) =
-                        store::list_apps_by_merchant(&mut conn, Uuid::parse_str(&claims.sub).unwrap())
-                    {
-                        let response = apps
-                            .into_iter()
-                            .map(|a| CreateAppResponse {
-                                app_id: a.id.to_string(),
-                                app_token: "hidden".to_string(), // don’t leak token
-                                title: a.title,
-                            })
-                            .collect();
-                        return HttpResponse::Ok().json(AppListResponse { apps: response });
-                    }
-                }
-            }
-        }
-    }
-    HttpResponse::Unauthorized().finish()
+) -> Result<HttpResponse, ApiError> {
+    let claims = bearer_claims(&http_req)?;
+    let merchant_id = merchant_uuid(&claims)?;
+    let mut conn = store::get_conn(&pool)?;
+
+    let apps = store::list_apps_by_merchant(&mut conn, merchant_id)
+        .map_err(|e| ApiError::Internal(format!("list apps: {e}")))?;
+    let response = apps
+        .into_iter()
+        .map(|a| CreateAppResponse {
+            app_id: a.id.to_string(),
+            app_token: "hidden".to_string(), // don't leak token
+            title: a.title,
+        })
+        .collect();
+    Ok(HttpResponse::Ok().json(AppListResponse { apps: response }))
 }
+
 #[post("/orders")]
 pub async fn create_order(
     req: web::Json<CreateOrderRequest>,
     http_req: HttpRequest,
     pool: web::Data<store::Pool>,
-) -> impl Responder {
-    if let Some(auth_header) = http_req.headers().get("Authorization") {
-        if let Ok(auth_str) = auth_header.to_str() {
-            if let Some(app_token) = auth_str.strip_prefix("Token ") {
-                let mut conn = match pool.get() {
-                    Ok(c) => c,
-                    Err(_) => return HttpResponse::InternalServerError().finish(),
-                };
+) -> Result<HttpResponse, ApiError> {
+    let app_token = app_token_from(&http_req)?;
+    let mut conn = store::get_conn(&pool)?;
 
-                // Validate app_token
-                match store::find_app_by_token(&mut conn, app_token) {
-                    Ok(app) => {
-                        let id = Uuid::new_v4();
-                        let memo_id = Uuid::new_v4().to_string();
-                        let payment_url = format!("https://pay.gateway.com/pay/{}", id);
+    let app = store::find_app_by_token(&mut conn, &app_token).map_err(|_| ApiError::Unauthorized)?;
 
-                        // Convert price_amount to USDC base units (6 decimals)
-                        // If price_amount is 1.0, this becomes 1000000
-                        let price_amount_decimal =
-                            BigDecimal::from_str(&req.price_amount.to_string()).unwrap();
-                        let usdc_decimals = BigDecimal::from(1_000_000); // 10^6 for USDC
-                        let price_amount_base_units = price_amount_decimal * usdc_decimals;
+    let id = Uuid::new_v4();
+    let memo_id = Uuid::new_v4().to_string();
+    let payment_url = format!("https://pay.gateway.com/pay/{}", id);
 
-                        let order = Order {
-                            id,
-                            app_id: Some(app.id),
-                            order_id: Some(req.order_id.clone()),
-                            price_amount: price_amount_base_units, // Now stored in base units
-                            price_currency: req.price_currency.clone(),
-                            receive_currency: req.receive_currency.clone(),
-                            memo_id: memo_id.clone(),
-                            status: "pending".to_string(),
-                            tx_hash: None,
-                            selected_mint: None,
-                            expected_amount: None,
-                            expected_decimals: None,
-                            callback_url: req.callback_url.clone(),
-                            success_url: req.success_url.clone(),
-                            cancel_url: req.cancel_url.clone(),
-                            created_at: None,
-                            confirmed_at: None,
-                        };
+    // Exact decimal-string -> integer base units (no f64 round-trip).
+    let price_amount_base_units = store::parse_base_units(&req.price_amount, USDC_DECIMALS)
+        .map_err(|e| ApiError::BadRequest(format!("invalid price_amount: {e}")))?;
 
-                        match store::insert_order(&mut conn, order) {
-                            Ok(inserted) => {
-                                return HttpResponse::Ok().json(CreateOrderResponse {
-                                    id: inserted.id.to_string(),
-                                    payment_url,
-                                    memo_id,
-                                    status: inserted.status,
-                                    amount: req.price_amount, // Return original amount for response
-                                    receive_currency: inserted.receive_currency,
-                                });
-                            }
-                            Err(_) => return HttpResponse::InternalServerError().finish(),
-                        }
-                    }
-                    Err(_) => return HttpResponse::Unauthorized().body("Invalid app token"),
-                }
-            }
-        }
-    }
+    let order = Order {
+        id,
+        app_id: Some(app.id),
+        order_id: Some(req.order_id.clone()),
+        price_amount: price_amount_base_units,
+        price_currency: req.price_currency.clone(),
+        receive_currency: req.receive_currency.clone(),
+        memo_id: memo_id.clone(),
+        status: "pending".to_string(),
+        tx_hash: None,
+        selected_mint: None,
+        expected_amount: None,
+        expected_decimals: None,
+        callback_url: req.callback_url.clone(),
+        success_url: req.success_url.clone(),
+        cancel_url: req.cancel_url.clone(),
+        created_at: None,
+        confirmed_at: None,
+    };
 
-    HttpResponse::Unauthorized().finish()
+    let inserted = store::insert_order(&mut conn, order)
+        .map_err(|e| ApiError::Internal(format!("insert order: {e}")))?;
+    Ok(HttpResponse::Ok().json(CreateOrderResponse {
+        id: inserted.id.to_string(),
+        payment_url,
+        memo_id,
+        status: inserted.status,
+        amount: req.price_amount.clone(),
+        receive_currency: inserted.receive_currency,
+    }))
 }
 
 #[get("/orders/{id}")]
@@ -364,37 +335,19 @@ pub async fn get_order(
     path: web::Path<String>,
     http_req: HttpRequest,
     pool: web::Data<store::Pool>,
-) -> impl Responder {
-    if let Some(auth_header) = http_req.headers().get("Authorization") {
-        if let Ok(auth_str) = auth_header.to_str() {
-            if let Some(app_token) = auth_str.strip_prefix("Token ") {
-                let mut conn = match pool.get() {
-                    Ok(c) => c,
-                    Err(_) => return HttpResponse::InternalServerError().finish(),
-                };
+) -> Result<HttpResponse, ApiError> {
+    let app_token = app_token_from(&http_req)?;
+    let oid = Uuid::parse_str(&path.into_inner())
+        .map_err(|_| ApiError::BadRequest("invalid order id".into()))?;
+    let mut conn = store::get_conn(&pool)?;
 
-                // Validate app_token
-                match store::find_app_by_token(&mut conn, app_token) {
-                    Ok(app) => {
-                        let oid = Uuid::parse_str(&path.into_inner()).unwrap();
+    let app = store::find_app_by_token(&mut conn, &app_token).map_err(|_| ApiError::Unauthorized)?;
 
-                        match store::find_order_by_app(&mut conn, oid, app.id) {
-                            Ok(order) => {
-                                return HttpResponse::Ok().json(OrderResponse {
-                                    id: order.id.to_string(),
-                                    status: order.status,
-                                    amount: order.price_amount.to_string().parse().unwrap(),
-                                    receive_currency: order.receive_currency,
-                                });
-                            }
-                            Err(_) => return HttpResponse::NotFound().finish(),
-                        }
-                    }
-                    Err(_) => return HttpResponse::Unauthorized().body("Invalid app token"),
-                }
-            }
-        }
-    }
-
-    HttpResponse::Unauthorized().finish()
+    let order = store::find_order_by_app(&mut conn, oid, app.id).map_err(|_| ApiError::NotFound)?;
+    Ok(HttpResponse::Ok().json(OrderResponse {
+        id: order.id.to_string(),
+        status: order.status,
+        amount: order.price_amount.to_string(),
+        receive_currency: order.receive_currency,
+    }))
 }

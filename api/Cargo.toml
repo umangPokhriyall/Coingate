@@ -29,3 +29,10 @@ num-traits = "0.2"
 solana-program = "3.0.0"
 reqwest = "0.12.23"
 redis = "0.24"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# Test-only: build an unchecked (never-connecting) pool for the negative/fuzz tests.
+diesel = { version = "2.1.4", features = ["postgres", "r2d2"] }

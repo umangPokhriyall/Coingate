@@ -63,16 +63,30 @@ pub fn list_apps_by_merchant(conn: &mut PgConnection, mid: Uuid) -> Result<Vec<A
         .load(conn)
 }
 
+/// App tokens are formatted `"<app_id>.<secret>"`. The `app_id` is a non-secret, already
+/// indexed (primary key) lookup id, so we fetch exactly one candidate row and bcrypt-verify
+/// only that one — replacing the previous full-table-scan-then-bcrypt-every-row. (Bounded
+/// auth fix only; not an auth redesign.)
 pub fn find_app_by_token(conn: &mut PgConnection, token: &str) -> Result<App, diesel::result::Error> {
+    use crate::schema::apps::dsl::*;
     use bcrypt::verify;
 
-    let all_apps: Vec<App> = apps::table.load::<App>(conn)?;
-    for a in all_apps {
-        if verify(token, &a.token_hash).unwrap_or(false) {
-            return Ok(a);
-        }
+    // Parse the indexed lookup id out of the token; a malformed token is simply "not found".
+    let lookup_id = token
+        .split_once('.')
+        .and_then(|(id_part, _)| Uuid::parse_str(id_part).ok())
+        .ok_or(diesel::result::Error::NotFound)?;
+
+    let candidate: App = apps
+        .filter(id.eq(lookup_id))
+        .select(App::as_select())
+        .first(conn)?;
+
+    if verify(token, &candidate.token_hash).unwrap_or(false) {
+        Ok(candidate)
+    } else {
+        Err(diesel::result::Error::NotFound)
     }
-    Err(diesel::result::Error::NotFound)
 }
 
 // ============ Orders ============
