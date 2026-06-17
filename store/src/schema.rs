@@ -34,6 +34,16 @@ diesel::table! {
 }
 
 diesel::table! {
+    dead_letter (id) {
+        id -> Uuid,
+        source_stream -> Text,
+        raw -> Jsonb,
+        reason -> Text,
+        created_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     deposits (id) {
         id -> Uuid,
         order_id -> Nullable<Uuid>,
@@ -60,6 +70,20 @@ diesel::table! {
 }
 
 diesel::table! {
+    idempotency_keys (key) {
+        key -> Text,
+        request_fingerprint -> Text,
+        status -> Text,
+        lease_deadline -> Nullable<Timestamptz>,
+        lease_owner -> Nullable<Uuid>,
+        response_snapshot -> Nullable<Jsonb>,
+        response_status -> Nullable<Int2>,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     merchants (id) {
         id -> Uuid,
         email -> Text,
@@ -73,7 +97,7 @@ diesel::table! {
     orders (id) {
         id -> Uuid,
         app_id -> Nullable<Uuid>,
-        order_id -> Nullable<Text>,
+        order_id -> Text,
         price_amount -> Numeric,
         price_currency -> Text,
         receive_currency -> Text,
@@ -88,6 +112,16 @@ diesel::table! {
         selected_mint -> Nullable<Text>,
         expected_amount -> Nullable<Numeric>,
         expected_decimals -> Nullable<Int4>,
+    }
+}
+
+diesel::table! {
+    outbox (id) {
+        id -> Uuid,
+        topic -> Text,
+        payload -> Jsonb,
+        created_at -> Timestamptz,
+        sent_at -> Nullable<Timestamptz>,
     }
 }
 
@@ -130,9 +164,12 @@ diesel::allow_tables_to_appear_in_same_query!(
     apps,
     audit_logs,
     balances,
+    dead_letter,
     deposits,
+    idempotency_keys,
     merchants,
     orders,
+    outbox,
     wallets,
     withdrawals,
 );

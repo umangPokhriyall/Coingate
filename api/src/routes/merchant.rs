@@ -301,7 +301,7 @@ pub async fn create_order(
     let order = Order {
         id,
         app_id: Some(app.id),
-        order_id: Some(req.order_id.clone()),
+        order_id: req.order_id.clone(),
         price_amount: price_amount_base_units,
         price_currency: req.price_currency.clone(),
         receive_currency: req.receive_currency.clone(),

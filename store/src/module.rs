@@ -1,5 +1,6 @@
 use crate::schema::{
-    apps, audit_logs, balances, deposits, merchants, orders, wallets, withdrawals,
+    apps, audit_logs, balances, dead_letter, deposits, idempotency_keys, merchants, orders, outbox,
+    wallets, withdrawals,
 };
 use bigdecimal::BigDecimal;
 use chrono::NaiveDateTime;
@@ -40,7 +41,7 @@ pub struct App {
 pub struct Order {
     pub id: Uuid,
     pub app_id: Option<Uuid>,
-    pub order_id: Option<String>,
+    pub order_id: String, // NOT NULL: the inbound idempotency natural key (UNIQUE with app_id)
     pub price_amount: BigDecimal,
     pub price_currency: String,
     pub receive_currency: String,
@@ -143,4 +144,46 @@ pub struct Withdrawal {
     pub tx_hash: Option<String>,
     pub created_at: Option<NaiveDateTime>,
     pub updated_at: Option<NaiveDateTime>,
+}
+
+// ============ Forward tables (Phase 1 fills these — Phase 0 lands types only) ============
+
+// ============ Idempotency Keys (Amendment 1 §A2) ============
+#[derive(Queryable, Selectable, Serialize, Deserialize, Debug, Clone)]
+#[diesel(table_name = idempotency_keys)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct IdempotencyKeyRow {
+    pub key: String,
+    pub request_fingerprint: String,
+    pub status: String, // 'in_progress' | 'completed'
+    pub lease_deadline: Option<NaiveDateTime>,
+    pub lease_owner: Option<Uuid>,
+    pub response_snapshot: Option<Value>,
+    pub response_status: Option<i16>,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+}
+
+// ============ Outbox ============
+#[derive(Queryable, Selectable, Serialize, Deserialize, Debug, Clone)]
+#[diesel(table_name = outbox)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct OutboxRow {
+    pub id: Uuid,
+    pub topic: String,
+    pub payload: Value,
+    pub created_at: NaiveDateTime,
+    pub sent_at: Option<NaiveDateTime>,
+}
+
+// ============ Dead Letter (poison-message sink) ============
+#[derive(Queryable, Selectable, Serialize, Deserialize, Debug, Clone)]
+#[diesel(table_name = dead_letter)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct DeadLetter {
+    pub id: Uuid,
+    pub source_stream: String,
+    pub raw: Value,
+    pub reason: String,
+    pub created_at: NaiveDateTime,
 }
