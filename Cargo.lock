@@ -3597,6 +3597,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "reconciler"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "store",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "redis"
 version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
