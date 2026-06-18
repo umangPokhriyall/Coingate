@@ -40,6 +40,17 @@ pub enum CrashPointId {
     /// After the credit `with_tx` committed but before the stream XACK. A crash here redelivers
     /// the entry; the `UNIQUE(tx_hash)` dedup absorbs it (credit-nothing on the duplicate).
     ProcAfterCommitBeforeXack,
+
+    // ── Phase 1, Session 1.4: worker effect-boundary reconciliation ────────────────────────
+    /// After the committed `pending -> processing` transition but before the external send. A
+    /// crash here leaves `processing`; redelivery reconciles via `lookup` (not seen sent).
+    WorkerAfterStatusProcessingBeforeSend,
+    /// After `send` returned a signature but before `finalize_success`. A crash here leaves
+    /// `processing`; redelivery's `lookup` returns the signature and finalizes (no re-send).
+    WorkerAfterSendBeforeFinalize,
+    /// After `finalize_success` committed but before the stream XACK. A crash here redelivers a
+    /// now-terminal withdrawal; the dispatch acks it as a no-op.
+    WorkerAfterFinalizeBeforeXack,
 }
 
 impl CrashPointId {
@@ -53,6 +64,9 @@ impl CrashPointId {
         CrashPointId::ProcAfterCreditBeforeOrderPaid,
         CrashPointId::ProcAfterOrderPaidBeforeCommit,
         CrashPointId::ProcAfterCommitBeforeXack,
+        CrashPointId::WorkerAfterStatusProcessingBeforeSend,
+        CrashPointId::WorkerAfterSendBeforeFinalize,
+        CrashPointId::WorkerAfterFinalizeBeforeXack,
     ];
 
     /// Stable string name used to arm a point via `COINGATE_CHAOS_FIRE`. Must round-trip
@@ -67,6 +81,11 @@ impl CrashPointId {
             CrashPointId::ProcAfterCreditBeforeOrderPaid => "ProcAfterCreditBeforeOrderPaid",
             CrashPointId::ProcAfterOrderPaidBeforeCommit => "ProcAfterOrderPaidBeforeCommit",
             CrashPointId::ProcAfterCommitBeforeXack => "ProcAfterCommitBeforeXack",
+            CrashPointId::WorkerAfterStatusProcessingBeforeSend => {
+                "WorkerAfterStatusProcessingBeforeSend"
+            }
+            CrashPointId::WorkerAfterSendBeforeFinalize => "WorkerAfterSendBeforeFinalize",
+            CrashPointId::WorkerAfterFinalizeBeforeXack => "WorkerAfterFinalizeBeforeXack",
         }
     }
 
@@ -117,8 +136,8 @@ mod tests_without_chaos {
     #[test]
     fn crash_point_is_a_noop_without_the_feature() {
         crash_point!(CrashPointId::SelfTest);
-        // Phase 0 shipped 1 variant; 1.2 appended 3 (Execute spine), 1.3 appended 4 (atomic credit).
-        assert_eq!(CrashPointId::ALL.len(), 8);
+        // Phase 0: 1; 1.2: +3 (Execute spine); 1.3: +4 (atomic credit); 1.4: +3 (worker).
+        assert_eq!(CrashPointId::ALL.len(), 11);
         assert_eq!(CrashPointId::SelfTest.name(), "SelfTest");
         // Names round-trip and are unique (a registry-closure precondition the Phase 2 harness relies on).
         for id in CrashPointId::ALL {

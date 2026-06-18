@@ -358,6 +358,32 @@ pub fn update_withdrawal_status(
         .get_result(conn)
 }
 
+/// Read a withdrawal by id (the worker dispatches on its `status`).
+pub fn find_withdrawal(conn: &mut PgConnection, withdrawal_id_: Uuid) -> Result<Withdrawal, Error> {
+    use crate::schema::withdrawals::dsl::*;
+    withdrawals
+        .find(withdrawal_id_)
+        .select(Withdrawal::as_select())
+        .first(conn)
+}
+
+/// Guarded `pending -> processing` transition (Phase 1 §6). Commits BEFORE the external send so
+/// that every redelivery thereafter reads `processing` and reconciles via `Signer::lookup`
+/// instead of re-sending. Returns rows affected: `1` = we advanced it (proceed to send), `0` =
+/// it was no longer `pending` (a concurrent consumer advanced it — do not send).
+pub fn set_withdrawal_processing(
+    conn: &mut PgConnection,
+    withdrawal_id_: Uuid,
+) -> Result<usize, Error> {
+    use crate::schema::withdrawals::dsl::*;
+    diesel::update(withdrawals.find(withdrawal_id_).filter(status.eq("pending")))
+        .set((
+            status.eq("processing"),
+            updated_at.eq(Utc::now().naive_utc()),
+        ))
+        .execute(conn)
+}
+
 // Lock funds and create withdrawal. MUST be called through `store::with_tx` (it issues
 // `FOR UPDATE` row locks and signals insufficient funds via `RollbackTransaction`). Logic
 // unchanged from the prior `conn.transaction` body; the wrapper moved out to `with_tx`.
@@ -484,52 +510,52 @@ pub fn revert_withdrawal_lock(
     Ok(updated)
 }
 
-// After worker succeeds, finalize withdrawal: set status completed, deduct locked_balance.
+// Idempotent finalize-success (Phase 1 §6): the balance move is GATED on the
+// `processing -> completed` transition actually firing, so a double-finalize moves money once.
+// Returns `true` iff this call performed the transition (and the locked-balance decrement);
+// `false` if the withdrawal was already terminal (no-op, balance untouched).
 // MUST be called through `store::with_tx`.
 pub fn finalize_withdrawal_success(
     conn: &mut PgConnection,
     withdrawal_id_: Uuid,
     tx_hash_: &str,
-) -> Result<Withdrawal, Error> {
+) -> Result<bool, Error> {
     use crate::schema::balances::dsl as b;
     use crate::schema::withdrawals::dsl as w;
 
-    // find withdrawal
-    let wd = w::withdrawals
-        .find(withdrawal_id_)
-        .first::<Withdrawal>(conn)?;
-
-    // set status = completed and tx_hash
-    let updated_wd: Withdrawal = diesel::update(w::withdrawals.find(wd.id))
+    // Guarded transition: only a `processing` withdrawal becomes `completed`.
+    let rows = diesel::update(w::withdrawals.find(withdrawal_id_).filter(w::status.eq("processing")))
         .set((
             w::status.eq("completed"),
             w::tx_hash.eq(Some(tx_hash_.to_string())),
             w::updated_at.eq(Utc::now().naive_utc()),
         ))
-        .get_result(conn)?;
+        .execute(conn)?;
+    if rows != 1 {
+        return Ok(false); // already terminal: no-op, do NOT touch the balance.
+    }
 
-    // reduce locked_balance (it was already deducted from balance at lock time)
-    // lock balance row and subtract from locked_balance
+    // Transition fired: reduce locked_balance by the (already-debited-from-balance) amount.
+    let wd = w::withdrawals
+        .find(withdrawal_id_)
+        .select(Withdrawal::as_select())
+        .first(conn)?;
     let bal = b::balances
         .filter(b::merchant_id.eq(wd.merchant_id))
-        .filter(b::token_mint.eq(wd.token_mint.clone()))
+        .filter(b::token_mint.eq(&wd.token_mint))
         .for_update()
         .first::<Balance>(conn)?;
+    let curr_locked = bal.locked_balance.clone().unwrap_or_else(|| BigDecimal::from(0));
+    let new_locked = &curr_locked - &wd.amount;
 
-    let curr_locked = bal
-        .locked_balance
-        .clone()
-        .unwrap_or_else(|| BigDecimal::from(0));
-    let new_locked = curr_locked - wd.amount.clone();
-
-    let _ = diesel::update(b::balances.filter(b::id.eq(bal.id)))
+    diesel::update(b::balances.filter(b::id.eq(bal.id)))
         .set((
             b::locked_balance.eq(new_locked),
             b::updated_at.eq(Utc::now().naive_utc()),
         ))
         .execute(conn)?;
 
-    Ok(updated_wd)
+    Ok(true)
 }
 
 // === Dead letter (poison-message sink, Brief §3.7) ===
@@ -553,44 +579,43 @@ pub fn insert_dead_letter(
         .get_result(conn)
 }
 
-// On failure: set withdrawal.status = failed and restore locked->balance.
-// MUST be called through `store::with_tx`.
+// Idempotent finalize-failed (Phase 1 §6): gated on the `processing -> failed` transition. On the
+// firing call it restores locked -> balance; a redelivery after a prior failed-finalize is a
+// no-op. Returns `true` iff this call performed the transition. MUST be called through `with_tx`.
 pub fn finalize_withdrawal_failed(
     conn: &mut PgConnection,
     withdrawal_id_: Uuid,
     _failure_reason: &str,
-) -> Result<Withdrawal, Error> {
+) -> Result<bool, Error> {
     use crate::schema::balances::dsl as b;
     use crate::schema::withdrawals::dsl as w;
 
-    let wd = w::withdrawals
-        .find(withdrawal_id_)
-        .first::<Withdrawal>(conn)?;
-
-    // set status = failed
-    let updated_wd: Withdrawal = diesel::update(w::withdrawals.find(wd.id))
+    let rows = diesel::update(w::withdrawals.find(withdrawal_id_).filter(w::status.eq("processing")))
         .set((
             w::status.eq("failed"),
             w::updated_at.eq(Utc::now().naive_utc()),
         ))
-        .get_result(conn)?;
+        .execute(conn)?;
+    if rows != 1 {
+        return Ok(false); // already terminal: no-op.
+    }
 
-    // move locked back to balance
+    // Transition fired: move the locked amount back to the available balance.
+    let wd = w::withdrawals
+        .find(withdrawal_id_)
+        .select(Withdrawal::as_select())
+        .first(conn)?;
     let bal = b::balances
         .filter(b::merchant_id.eq(wd.merchant_id))
-        .filter(b::token_mint.eq(wd.token_mint.clone()))
+        .filter(b::token_mint.eq(&wd.token_mint))
         .for_update()
         .first::<Balance>(conn)?;
-
-    let curr_locked = bal
-        .locked_balance
-        .clone()
-        .unwrap_or_else(|| BigDecimal::from(0));
+    let curr_locked = bal.locked_balance.clone().unwrap_or_else(|| BigDecimal::from(0));
     let curr_balance = bal.balance.clone().unwrap_or_else(|| BigDecimal::from(0));
-    let new_locked = &curr_locked - wd.amount.clone();
-    let new_balance = &curr_balance + wd.amount.clone();
+    let new_locked = &curr_locked - &wd.amount;
+    let new_balance = &curr_balance + &wd.amount;
 
-    let _ = diesel::update(b::balances.filter(b::id.eq(bal.id)))
+    diesel::update(b::balances.filter(b::id.eq(bal.id)))
         .set((
             b::balance.eq(new_balance),
             b::locked_balance.eq(new_locked),
@@ -598,5 +623,5 @@ pub fn finalize_withdrawal_failed(
         ))
         .execute(conn)?;
 
-    Ok(updated_wd)
+    Ok(true)
 }

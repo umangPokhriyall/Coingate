@@ -1,5 +1,6 @@
 use anyhow::Result;
 use bigdecimal::{BigDecimal, ToPrimitive};
+use chaos_hooks::crash_point;
 use external::{MpcSigner, SendRequest, Signer, SignerError};
 use redis::Value as RedisValue;
 use serde_json::Value;
@@ -8,6 +9,9 @@ use std::str::FromStr;
 use store::{Config, Pool, build_pool, get_conn, with_tx};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+// SOL native mint: a withdrawal in this mint is a native transfer (no `mint` on the send).
+const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
 #[derive(Debug, Clone)]
 struct WithdrawalPayload {
@@ -124,10 +128,15 @@ async fn main() -> Result<()> {
     let pool = build_pool(&cfg).expect("failed to build database pool");
 
     // The fat wallet (the MPC send endpoint) is fixed; resolve it once and inject the signer.
+    // The MPC base URL comes from Config (no more hardcoded literal — Phase 1 §6).
     let mut db = get_conn(&pool).expect("failed to get DB connection");
     let fat_wallet = store::get_fat_wallet(&mut db).expect("fat wallet not configured");
     drop(db);
-    let send_url = format!("http://127.0.0.1:3000/wallets/{}/send", fat_wallet.id);
+    let send_url = format!(
+        "{}/wallets/{}/send",
+        cfg.mpc_base_url.trim_end_matches('/'),
+        fat_wallet.id
+    );
     let signer = MpcSigner::new(send_url);
 
     let group = "withdrawals_group";
@@ -154,10 +163,20 @@ async fn main() -> Result<()> {
 
         for (stream, redis_id, data_str) in parse_xreadgroup_response(xauto) {
             match parse_withdrawal_payload(&data_str) {
-                Ok(payload) => {
-                    process_withdrawal(&pool, &signer, &payload, &mut conn, group, &stream, &redis_id)
-                        .await?;
-                }
+                Ok(payload) => match process_withdrawal(&pool, &signer, &payload).await {
+                    Ok(Disposition::Ack) => {
+                        crash_point!(chaos_hooks::CrashPointId::WorkerAfterFinalizeBeforeXack);
+                        if let Err(e) = xack(&mut conn, &stream, group, &redis_id) {
+                            error!(error = %e, %stream, %redis_id, "XACK failed");
+                        }
+                    }
+                    // Ambiguous/raced: leave un-acked so a redelivery reconciles it.
+                    Ok(Disposition::Leave) => {}
+                    // Infra error: leave un-acked rather than crash the consumer loop.
+                    Err(e) => {
+                        error!(error = %e, %stream, %redis_id, "withdrawal processing error, leaving un-acked")
+                    }
+                },
                 Err(e) => warn!(error = %e, %stream, %redis_id, "malformed withdrawal payload, skipping"),
             }
         }
@@ -177,103 +196,143 @@ async fn main() -> Result<()> {
 
         for (stream, redis_id, data_str) in parse_xreadgroup_response(xread) {
             match parse_withdrawal_payload(&data_str) {
-                Ok(payload) => {
-                    process_withdrawal(&pool, &signer, &payload, &mut conn, group, &stream, &redis_id)
-                        .await?;
-                }
+                Ok(payload) => match process_withdrawal(&pool, &signer, &payload).await {
+                    Ok(Disposition::Ack) => {
+                        crash_point!(chaos_hooks::CrashPointId::WorkerAfterFinalizeBeforeXack);
+                        if let Err(e) = xack(&mut conn, &stream, group, &redis_id) {
+                            error!(error = %e, %stream, %redis_id, "XACK failed");
+                        }
+                    }
+                    // Ambiguous/raced: leave un-acked so a redelivery reconciles it.
+                    Ok(Disposition::Leave) => {}
+                    // Infra error: leave un-acked rather than crash the consumer loop.
+                    Err(e) => {
+                        error!(error = %e, %stream, %redis_id, "withdrawal processing error, leaving un-acked")
+                    }
+                },
                 Err(e) => warn!(error = %e, %stream, %redis_id, "malformed withdrawal payload, skipping"),
             }
         }
     }
 }
 
-async fn process_withdrawal<S: Signer>(
+/// Whether the caller should XACK the stream entry. `Leave` means the entry stays pending so a
+/// redelivery can reconcile it (the ambiguous Transport case, or a lost pending->processing race).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Disposition {
+    Ack,
+    Leave,
+}
+
+fn xack(conn: &mut redis::Connection, stream: &str, group: &str, redis_id: &str) -> Result<()> {
+    let _: () = redis::cmd("XACK").arg(stream).arg(group).arg(redis_id).query(conn)?;
+    Ok(())
+}
+
+/// Convert the payload's decimal amount into the chain's base units (lamports / token units).
+fn to_base_units(pool: &Pool, payload: &WithdrawalPayload) -> Result<u64> {
+    if payload.token_mint == SOL_MINT {
+        Ok((payload.amount.clone() * BigDecimal::from(1_000_000_000u64))
+            .to_u64()
+            .unwrap_or(0))
+    } else {
+        let mut db = get_conn(pool)?;
+        let decimals = store::get_token_decimals(&mut db, &payload.token_mint)?;
+        let factor = BigDecimal::from(10u64.pow(decimals as u32));
+        Ok((payload.amount.clone() * factor).to_u64().unwrap_or(0))
+    }
+}
+
+/// Perform the external send (key = withdrawal_id) and finalize. Reached only when the send is
+/// safe: from `pending` after a committed `pending->processing`, or from `processing` when
+/// `lookup` confirms it was NOT yet sent. The Transport/Rejected/NoSignature three-way is
+/// preserved: Transport is ambiguous (`Leave` -> redelivery reconciles); a definite rejection
+/// finalizes failed and acks.
+async fn send_and_finalize<S: Signer>(
     pool: &Pool,
     signer: &S,
     payload: &WithdrawalPayload,
-    conn: &mut redis::Connection,
-    group: &str,
-    stream: &str,
-    redis_id: &str,
-) -> Result<()> {
-    let withdrawal_id = payload.withdrawal_id;
-
-    info!(%withdrawal_id, %stream, %redis_id, "processing withdrawal");
-
-    // Pooled connection for the pre-send, single-statement DB work.
-    let mut db = get_conn(pool)?;
-
-    // Update status to 'processing'
-    let _ = store::update_withdrawal_status(&mut db, withdrawal_id, "processing", None)?;
-    debug!(%withdrawal_id, "withdrawal status set to 'processing'");
-
-    // Determine if token or SOL
-    let is_sol = payload.token_mint == "So11111111111111111111111111111111111111112";
-
-    // Convert amount to smallest unit (unchanged logic)
-    let amount_u64 = if is_sol {
-        let lamports_per_sol = 1_000_000_000u64;
-        (payload.amount.clone() * BigDecimal::from(lamports_per_sol))
-            .to_u64()
-            .unwrap_or(0)
-    } else {
-        let decimals = store::get_token_decimals(&mut db, &payload.token_mint)?; // fetch decimals from DB
-        let factor = BigDecimal::from(10u64.pow(decimals as u32));
-        (payload.amount.clone() * factor).to_u64().unwrap_or(0)
-    };
-
-    // Done with pooled DB connection before the MPC network call.
-    drop(db);
-
-    debug!(amount = %payload.amount, amount_base_units = amount_u64, "converted withdrawal amount");
-
-    // Send through the Signer trait, passing key = withdrawal_id (the effect idempotency key).
-    // Phase 0 still calls send on the happy path; status-guard + lookup reconciliation is Phase 1.4.
-    let mint = if is_sol {
+) -> Result<Disposition> {
+    let id = payload.withdrawal_id;
+    let amount_u64 = to_base_units(pool, payload)?;
+    let mint = if payload.token_mint == SOL_MINT {
         None
     } else {
         Some(payload.token_mint.as_str())
     };
-    let req = SendRequest {
-        key: withdrawal_id,
-        to: &payload.target_address,
-        amount: amount_u64,
-        mint,
-    };
+    let req = SendRequest { key: id, to: &payload.target_address, amount: amount_u64, mint };
 
     match signer.send(req).await {
         Ok(sig) => {
+            crash_point!(chaos_hooks::CrashPointId::WorkerAfterSendBeforeFinalize);
             let sig = sig.to_string();
-            with_tx(pool, |c| {
-                store::finalize_withdrawal_success(c, withdrawal_id, &sig)
-            })?;
-            let _: () = redis::cmd("XACK")
-                .arg(stream)
-                .arg(group)
-                .arg(redis_id)
-                .query(conn)?;
-            info!(%withdrawal_id, %sig, "withdrawal completed successfully");
+            let _ = with_tx(pool, |c| store::finalize_withdrawal_success(c, id, &sig))?;
+            info!(%id, %sig, "withdrawal completed successfully");
+            Ok(Disposition::Ack)
         }
         Err(SignerError::Transport(e)) => {
-            // Ambiguous: we do not know if the MPC sent. Leave the withdrawal `processing`
-            // and do NOT ack — Phase 1.4 reconciles via lookup instead of re-sending.
-            error!(%withdrawal_id, error = %e, "transport error calling MPC; leaving withdrawal pending");
+            // Ambiguous: we don't know if the MPC sent. Leave `processing`, do NOT ack — the
+            // redelivery lands in `processing` and reconciles via `lookup` (never blind-resends).
+            error!(%id, error = %e, "transport error; leaving withdrawal processing for reconcile");
+            Ok(Disposition::Leave)
         }
         Err(e) => {
-            // Definite failure (rejected / no signature): finalize as failed and ack.
-            with_tx(pool, |c| {
-                store::finalize_withdrawal_failed(c, withdrawal_id, &e.to_string())
-            })?;
-            let _: () = redis::cmd("XACK")
-                .arg(stream)
-                .arg(group)
-                .arg(redis_id)
-                .query(conn)?;
-            warn!(%withdrawal_id, error = %e, "withdrawal failed");
+            // Definite failure (rejected / no signature): finalize failed and ack.
+            let _ = with_tx(pool, |c| store::finalize_withdrawal_failed(c, id, &e.to_string()))?;
+            warn!(%id, error = %e, "withdrawal failed");
+            Ok(Disposition::Ack)
         }
     }
+}
 
-    Ok(())
+/// Dispatch on the withdrawal's CURRENT state (Phase 1 §6). `send` is reached only from
+/// `pending`; every redelivery thereafter lands in `processing` (or a terminal state) and
+/// reconciles, so `send` is called exactly once per withdrawal. Returns the ack disposition; the
+/// caller performs the XACK (so this function is pure of Redis and unit-testable on a DB alone).
+async fn process_withdrawal<S: Signer>(
+    pool: &Pool,
+    signer: &S,
+    payload: &WithdrawalPayload,
+) -> Result<Disposition> {
+    let id = payload.withdrawal_id;
+    info!(%id, "processing withdrawal");
+
+    let wd = with_tx(pool, |c| store::find_withdrawal(c, id))?;
+    match wd.status.as_str() {
+        // Terminal: a redelivery after finalize-then-crash-before-xack. Ack, no-op.
+        "completed" | "failed" => {
+            debug!(%id, status = %wd.status, "terminal withdrawal redelivery; acking no-op");
+            Ok(Disposition::Ack)
+        }
+        // Ambiguous: we may already have sent. RECONCILE via lookup, never blind-resend.
+        "processing" => match signer.lookup(id).await? {
+            Some(sig) => {
+                let sig = sig.to_string();
+                let _ = with_tx(pool, |c| store::finalize_withdrawal_success(c, id, &sig))?;
+                info!(%id, %sig, "reconciled: prior send found; finalized");
+                Ok(Disposition::Ack)
+            }
+            None => {
+                debug!(%id, "reconciled: not sent yet; sending now");
+                send_and_finalize(pool, signer, payload).await
+            }
+        },
+        // Fresh: commit pending->processing BEFORE sending, then send exactly once.
+        "pending" => {
+            let advanced = with_tx(pool, |c| store::set_withdrawal_processing(c, id))?;
+            crash_point!(chaos_hooks::CrashPointId::WorkerAfterStatusProcessingBeforeSend);
+            if advanced == 0 {
+                // Another consumer advanced it past `pending`; reconcile on the next redelivery.
+                warn!(%id, "withdrawal no longer pending (raced); will reconcile on redelivery");
+                return Ok(Disposition::Leave);
+            }
+            send_and_finalize(pool, signer, payload).await
+        }
+        other => {
+            warn!(%id, status = %other, "unknown withdrawal status; leaving un-acked");
+            Ok(Disposition::Leave)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -334,5 +393,147 @@ mod tests {
             let result = parse_withdrawal_payload(&raw);
             assert!(result.is_err(), "expected Err for hostile input: {raw}");
         }
+    }
+
+    // ── DB-backed: send-once + idempotent finalize (gated on DATABASE_URL; redis not needed) ──
+    //
+    //   DATABASE_URL=postgres:///coingate_wrk_test?host=/var/run/postgresql cargo test -p worker
+    use external::CountingMockSigner;
+
+    fn db_pool_or_skip() -> Option<Pool> {
+        let url = std::env::var("DATABASE_URL").ok()?;
+        let manager = store::diesel::r2d2::ConnectionManager::<store::PgConnection>::new(url);
+        store::diesel::r2d2::Pool::builder().max_size(2).build(manager).ok()
+    }
+
+    fn seed_merchant(pool: &Pool) -> Uuid {
+        let mut c = get_conn(pool).expect("conn");
+        store::insert_merchant(
+            &mut c,
+            store::module::Merchant {
+                id: Uuid::new_v4(),
+                email: format!("m-{}@t.local", Uuid::new_v4()),
+                password_hash: "x".to_string(),
+                name: "t".to_string(),
+                created_at: None,
+            },
+        )
+        .expect("merchant")
+        .id
+    }
+
+    /// Fund a SOL balance and lock a `pending` withdrawal; return (withdrawal, payload).
+    fn seed_locked_withdrawal(
+        pool: &Pool,
+        merchant_id: Uuid,
+        fund: i64,
+        amount: i64,
+    ) -> (store::module::Withdrawal, WithdrawalPayload) {
+        {
+            let mut c = get_conn(pool).expect("conn");
+            store::upsert_balance(&mut c, merchant_id, SOL_MINT, &BigDecimal::from(fund))
+                .expect("fund");
+        }
+        let amount_bd = BigDecimal::from(amount);
+        let wd = with_tx(pool, |c| {
+            store::create_withdrawal_and_lock(c, merchant_id, SOL_MINT, &amount_bd, "addr")
+        })
+        .expect("lock");
+        let payload = WithdrawalPayload {
+            withdrawal_id: wd.id,
+            merchant_id,
+            token_mint: SOL_MINT.to_string(),
+            amount: amount_bd,
+            target_address: "addr".to_string(),
+            created_at: "t".to_string(),
+        };
+        (wd, payload)
+    }
+
+    fn withdrawal_status(pool: &Pool, id: Uuid) -> String {
+        let mut c = get_conn(pool).expect("conn");
+        store::find_withdrawal(&mut c, id).expect("find").status
+    }
+
+    #[tokio::test]
+    async fn db_send_count_is_one_across_redeliveries() {
+        let Some(pool) = db_pool_or_skip() else {
+            eprintln!("skipping worker db test: DATABASE_URL unset/unreachable");
+            return;
+        };
+        let merchant_id = seed_merchant(&pool);
+        let (wd, payload) = seed_locked_withdrawal(&pool, merchant_id, 10, 2);
+        let signer = CountingMockSigner::new();
+
+        // First delivery: pending -> processing -> send -> finalize.
+        assert_eq!(process_withdrawal(&pool, &signer, &payload).await.unwrap(), Disposition::Ack);
+        assert_eq!(signer.send_count(wd.id), 1);
+        assert_eq!(withdrawal_status(&pool, wd.id), "completed");
+
+        // Redelivery of a now-terminal withdrawal: ack no-op, NO resend.
+        assert_eq!(process_withdrawal(&pool, &signer, &payload).await.unwrap(), Disposition::Ack);
+        assert_eq!(signer.send_count(wd.id), 1, "redelivery must not resend");
+    }
+
+    #[tokio::test]
+    async fn db_reconcile_from_processing_when_not_yet_sent_sends_once() {
+        let Some(pool) = db_pool_or_skip() else { return };
+        let merchant_id = seed_merchant(&pool);
+        let (wd, payload) = seed_locked_withdrawal(&pool, merchant_id, 10, 2);
+
+        // Simulate a crash AFTER pending->processing but BEFORE send: leave it in `processing`.
+        let _ = with_tx(&pool, |c| store::set_withdrawal_processing(c, wd.id)).unwrap();
+        let signer = CountingMockSigner::new();
+
+        // Redelivery: processing -> lookup None -> send exactly once -> finalize.
+        assert_eq!(process_withdrawal(&pool, &signer, &payload).await.unwrap(), Disposition::Ack);
+        assert_eq!(signer.send_count(wd.id), 1);
+        assert_eq!(withdrawal_status(&pool, wd.id), "completed");
+
+        // Another redelivery: terminal, still one send.
+        assert_eq!(process_withdrawal(&pool, &signer, &payload).await.unwrap(), Disposition::Ack);
+        assert_eq!(signer.send_count(wd.id), 1);
+    }
+
+    #[tokio::test]
+    async fn db_reconcile_from_processing_with_prior_send_does_not_resend() {
+        let Some(pool) = db_pool_or_skip() else { return };
+        let merchant_id = seed_merchant(&pool);
+        let (wd, payload) = seed_locked_withdrawal(&pool, merchant_id, 10, 2);
+
+        let _ = with_tx(&pool, |c| store::set_withdrawal_processing(c, wd.id)).unwrap();
+        let signer = CountingMockSigner::new();
+        // Simulate the send having happened (crash before finalize): record it in the signer.
+        let _ = signer
+            .send(SendRequest { key: wd.id, to: "addr", amount: 1, mint: None })
+            .await
+            .unwrap();
+        assert_eq!(signer.send_count(wd.id), 1);
+
+        // Redelivery: processing -> lookup Some -> finalize, with NO new send.
+        assert_eq!(process_withdrawal(&pool, &signer, &payload).await.unwrap(), Disposition::Ack);
+        assert_eq!(signer.send_count(wd.id), 1, "lookup path must not resend");
+        assert_eq!(withdrawal_status(&pool, wd.id), "completed");
+    }
+
+    #[tokio::test]
+    async fn db_double_finalize_moves_balance_once() {
+        let Some(pool) = db_pool_or_skip() else { return };
+        let merchant_id = seed_merchant(&pool);
+        let (wd, _payload) = seed_locked_withdrawal(&pool, merchant_id, 10, 2);
+        // fund 10, lock 2 -> balance 8, locked 2.
+        let _ = with_tx(&pool, |c| store::set_withdrawal_processing(c, wd.id)).unwrap();
+
+        let first = with_tx(&pool, |c| store::finalize_withdrawal_success(c, wd.id, "sig")).unwrap();
+        assert!(first, "first finalize performs the transition");
+        let second = with_tx(&pool, |c| store::finalize_withdrawal_success(c, wd.id, "sig")).unwrap();
+        assert!(!second, "second finalize is a no-op");
+
+        let bal = {
+            let mut c = get_conn(&pool).expect("conn");
+            store::get_balance(&mut c, merchant_id, SOL_MINT).expect("balance")
+        };
+        assert_eq!(bal.locked_balance.unwrap(), BigDecimal::from(0), "locked moved exactly once");
+        assert_eq!(bal.balance.unwrap(), BigDecimal::from(8), "available balance unchanged by finalize");
     }
 }

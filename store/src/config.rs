@@ -9,6 +9,9 @@ pub struct Config {
     pub jwt_secret: String,
     pub solana_rpc_url: String,
     pub listen_addr: String,
+    /// Base URL of the MPC signing service, e.g. `http://127.0.0.1:3000`. The worker builds the
+    /// per-wallet send URL from this (was a hardcoded literal in the worker — Phase 1 §6).
+    pub mpc_base_url: String,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -29,6 +32,7 @@ impl Config {
             jwt_secret: required("JWT_SECRET")?,
             solana_rpc_url: required("SOLANA_RPC_URL")?,
             listen_addr: required("LISTEN_ADDR")?,
+            mpc_base_url: required("MPC_BASE_URL")?,
         })
     }
 }
