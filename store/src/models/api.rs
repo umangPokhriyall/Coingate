@@ -625,3 +625,43 @@ pub fn finalize_withdrawal_failed(
 
     Ok(true)
 }
+
+// === Transactional outbox (Phase 1 §7) ===
+// The durable publish-intent. `/withdrawals` writes the funds lock AND an outbox row in ONE
+// `with_tx`, closing the dual-write (Brief §3.4); the `relay` binary drains unsent rows to Redis
+// at-least-once and marks them sent. `XADD` then `mark-sent` cannot be atomic (Redis is outside
+// the DB tx) — that is the design; the consumer-side dedup absorbs a republished row.
+
+/// Insert a publish-intent row (status = unsent). Called INSIDE the `/withdrawals` Execute
+/// `with_tx`, alongside `create_withdrawal_and_lock`, so the lock and the intent commit together.
+pub fn insert_outbox(
+    conn: &mut PgConnection,
+    topic_: &str,
+    payload_: &serde_json::Value,
+) -> Result<OutboxRow, Error> {
+    use crate::schema::outbox::dsl::*;
+    diesel::insert_into(outbox)
+        .values((topic.eq(topic_), payload.eq(payload_.clone())))
+        .returning(OutboxRow::as_returning())
+        .get_result(conn)
+}
+
+/// Read the unsent backlog oldest-first (`WHERE sent_at IS NULL ORDER BY created_at`). The relay
+/// publishes these and marks each sent after its `XADD`.
+pub fn select_unsent_outbox(conn: &mut PgConnection) -> Result<Vec<OutboxRow>, Error> {
+    use crate::schema::outbox::dsl::*;
+    outbox
+        .filter(sent_at.is_null())
+        .order(created_at.asc())
+        .select(OutboxRow::as_select())
+        .load(conn)
+}
+
+/// Mark an outbox row published (`SET sent_at = now() WHERE id = ?`). Runs AFTER the `XADD`; a
+/// crash between the two republishes the row on restart (at-least-once). Returns rows affected.
+pub fn mark_outbox_sent(conn: &mut PgConnection, outbox_id_: Uuid) -> Result<usize, Error> {
+    use crate::schema::outbox::dsl::*;
+    diesel::update(outbox.find(outbox_id_))
+        .set(sent_at.eq(Utc::now().naive_utc()))
+        .execute(conn)
+}

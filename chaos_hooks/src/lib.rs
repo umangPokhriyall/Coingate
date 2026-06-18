@@ -51,6 +51,21 @@ pub enum CrashPointId {
     /// After `finalize_success` committed but before the stream XACK. A crash here redelivers a
     /// now-terminal withdrawal; the dispatch acks it as a no-op.
     WorkerAfterFinalizeBeforeXack,
+
+    // ── Phase 1, Session 1.5: transactional outbox + relay ─────────────────────────────────
+    /// Inside the `/withdrawals` Execute `with_tx`, after `create_withdrawal_and_lock` but before
+    /// the `insert_outbox`. A crash here rolls both back — funds are never locked without a
+    /// matching publish-intent (the dual-write window is closed).
+    WithdrawAfterLockBeforeOutbox,
+    /// Inside the same `with_tx`, after `insert_outbox` but before the conditional `complete`
+    /// flip. A crash here rolls lock+outbox back together — nothing commits without completion.
+    WithdrawAfterOutboxBeforeComplete,
+    /// In the relay loop, after reading an unsent outbox row but before the `XADD`. A crash here
+    /// publishes nothing; the row stays `sent_at IS NULL` and is re-read on restart.
+    RelayAfterReadBeforeXadd,
+    /// In the relay loop, after the `XADD` but before `mark_outbox_sent`. A crash here republishes
+    /// the row on restart (outbox is at-least-once); consumer-side dedup absorbs the duplicate.
+    RelayAfterXaddBeforeMarkSent,
 }
 
 impl CrashPointId {
@@ -67,6 +82,10 @@ impl CrashPointId {
         CrashPointId::WorkerAfterStatusProcessingBeforeSend,
         CrashPointId::WorkerAfterSendBeforeFinalize,
         CrashPointId::WorkerAfterFinalizeBeforeXack,
+        CrashPointId::WithdrawAfterLockBeforeOutbox,
+        CrashPointId::WithdrawAfterOutboxBeforeComplete,
+        CrashPointId::RelayAfterReadBeforeXadd,
+        CrashPointId::RelayAfterXaddBeforeMarkSent,
     ];
 
     /// Stable string name used to arm a point via `COINGATE_CHAOS_FIRE`. Must round-trip
@@ -86,6 +105,10 @@ impl CrashPointId {
             }
             CrashPointId::WorkerAfterSendBeforeFinalize => "WorkerAfterSendBeforeFinalize",
             CrashPointId::WorkerAfterFinalizeBeforeXack => "WorkerAfterFinalizeBeforeXack",
+            CrashPointId::WithdrawAfterLockBeforeOutbox => "WithdrawAfterLockBeforeOutbox",
+            CrashPointId::WithdrawAfterOutboxBeforeComplete => "WithdrawAfterOutboxBeforeComplete",
+            CrashPointId::RelayAfterReadBeforeXadd => "RelayAfterReadBeforeXadd",
+            CrashPointId::RelayAfterXaddBeforeMarkSent => "RelayAfterXaddBeforeMarkSent",
         }
     }
 
@@ -136,8 +159,9 @@ mod tests_without_chaos {
     #[test]
     fn crash_point_is_a_noop_without_the_feature() {
         crash_point!(CrashPointId::SelfTest);
-        // Phase 0: 1; 1.2: +3 (Execute spine); 1.3: +4 (atomic credit); 1.4: +3 (worker).
-        assert_eq!(CrashPointId::ALL.len(), 11);
+        // Phase 0: 1; 1.2: +3 (Execute spine); 1.3: +4 (atomic credit); 1.4: +3 (worker);
+        // 1.5: +4 (outbox + relay).
+        assert_eq!(CrashPointId::ALL.len(), 15);
         assert_eq!(CrashPointId::SelfTest.name(), "SelfTest");
         // Names round-trip and are unique (a registry-closure precondition the Phase 2 harness relies on).
         for id in CrashPointId::ALL {

@@ -106,6 +106,11 @@ impl SolanaChain {
     }
 }
 
+/// Per-RPC-page signature cap (Solana's `getSignaturesForAddress` max). Pagination loops over
+/// pages of this size with the `before` cursor, so a burst larger than one page is still drained
+/// gap-free.
+const PAGE_LIMIT: usize = 1000;
+
 impl Chain for SolanaChain {
     async fn deposits_since(
         &self,
@@ -115,29 +120,52 @@ impl Chain for SolanaChain {
             .as_ref()
             .and_then(|c| c.signature.parse::<Signature>().ok());
 
-        let sigs = self
-            .rpc
-            .get_signatures_for_address_with_config(
-                &self.fat_pubkey,
-                GetConfirmedSignaturesForAddress2Config {
-                    before: None, // newest first
-                    until,        // stop at our checkpoint
-                    limit: Some(10),
-                    commitment: Some(CommitmentConfig::confirmed()),
-                },
-            )
-            .await
-            .map_err(|e| ChainError::Rpc(e.to_string()))?;
+        // Gap-free backfill (Phase 1 §7): page BACKWARD (newest -> oldest) with the `before`
+        // cursor, stopping at the stored checkpoint (`until`), and accumulate EVERY intervening
+        // signature. The previous single `limit:10` fetch advanced the checkpoint to the newest
+        // signature while silently dropping anything older than the 10th — a loss on any burst
+        // bigger than a page. Here no signature between the checkpoint and chain head is skipped,
+        // regardless of burst size. The `Chain::deposits_since` signature is unchanged; only this
+        // internal loop changed.
+        let mut all_sigs = Vec::new();
+        let mut before: Option<Signature> = None;
+        loop {
+            let page = self
+                .rpc
+                .get_signatures_for_address_with_config(
+                    &self.fat_pubkey,
+                    GetConfirmedSignaturesForAddress2Config {
+                        before,       // walk older than the last page's tail
+                        until,        // stop at our checkpoint
+                        limit: Some(PAGE_LIMIT),
+                        commitment: Some(CommitmentConfig::confirmed()),
+                    },
+                )
+                .await
+                .map_err(|e| ChainError::Rpc(e.to_string()))?;
 
-        // Advance the checkpoint to the newest signature SEEN (even ones we skip), matching
-        // the previous poller behavior so skipped txs are not reprocessed.
-        let new_cursor = sigs.first().map(|s| Cursor {
+            let page_len = page.len();
+            // Advance `before` to this page's OLDEST signature for the next round.
+            before = page
+                .last()
+                .and_then(|s| s.signature.parse::<Signature>().ok());
+            all_sigs.extend(page);
+
+            // A short page means we have reached the checkpoint (or chain start) — done.
+            if page_len < PAGE_LIMIT || before.is_none() {
+                break;
+            }
+        }
+
+        // Advance the checkpoint to the newest signature SEEN (the first of the first page),
+        // matching the previous poller behavior so processed txs are not re-fetched next round.
+        let new_cursor = all_sigs.first().map(|s| Cursor {
             signature: s.signature.clone(),
         });
 
         let mut events = Vec::new();
-        // Process oldest-first among the new ones.
-        for s in sigs.iter().rev() {
+        // `all_sigs` is newest-first across all pages; emit OLDEST-first.
+        for s in all_sigs.iter().rev() {
             let Ok(signature) = s.signature.parse::<Signature>() else {
                 continue;
             };

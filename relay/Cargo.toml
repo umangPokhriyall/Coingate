@@ -1,0 +1,20 @@
+[package]
+name = "relay"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+redis = "0.24"
+store = { path = "../store" }                 # Config, pool, outbox queries
+chaos_hooks = { path = "../chaos_hooks" }     # crash-point fire-sites (compile out by default)
+
+serde_json = "1.0"
+anyhow = "1.0"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+# Crash-point fire-sites compile to nothing unless enabled (Amendment §A1).
+# Build per-crate: `cargo build -p relay --features chaos`.
+chaos = ["chaos_hooks/chaos"]
