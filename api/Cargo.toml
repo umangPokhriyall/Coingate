@@ -13,6 +13,8 @@ chrono = { version = "0.4", features = ["serde"] }
 bigdecimal = { version = "0.4", features = ["serde"] }
 
 store = { path="../store"}
+idempotency = { path="../idempotency"}
+chaos_hooks = { path="../chaos_hooks"}
 jsonwebtoken = "9.3.1"
 bcrypt = "0.17.1"
 base64 = "0.22.1"
@@ -32,6 +34,11 @@ redis = "0.24"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+# Crash-point fire-sites compile to nothing unless this is enabled (Amendment §A1). The
+# workspace is virtual, so build per-crate: `cargo build -p api --features chaos`.
+chaos = ["chaos_hooks/chaos"]
 
 [dev-dependencies]
 # Test-only: build an unchecked (never-connecting) pool for the negative/fuzz tests.

@@ -1,6 +1,7 @@
 use crate::error::ApiError;
 use actix_web::{HttpRequest, HttpResponse, get, post, web};
 use bcrypt::{hash, verify};
+use bigdecimal::BigDecimal;
 use chrono::{Duration, Utc};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
@@ -281,53 +282,70 @@ pub async fn list_apps(
 
 #[post("/orders")]
 pub async fn create_order(
-    req: web::Json<CreateOrderRequest>,
     http_req: HttpRequest,
+    body: web::Bytes,
     pool: web::Data<store::Pool>,
 ) -> Result<HttpResponse, ApiError> {
     let app_token = app_token_from(&http_req)?;
-    let mut conn = store::get_conn(&pool)?;
 
-    let app = store::find_app_by_token(&mut conn, &app_token).map_err(|_| ApiError::Unauthorized)?;
+    // Idempotency-Key required (400 if absent); fingerprint hashes the RAW body BEFORE deser.
+    let key = crate::idem::extract_idempotency_key(&http_req)?;
+    let fingerprint =
+        idempotency::request_fingerprint(http_req.method().as_str(), http_req.path(), &body);
 
-    let id = Uuid::new_v4();
-    let memo_id = Uuid::new_v4().to_string();
-    let payment_url = format!("https://pay.gateway.com/pay/{}", id);
+    // Deserialize from the buffered bytes — a malformed body is a 400, never a panic.
+    let req: CreateOrderRequest = serde_json::from_slice(&body)
+        .map_err(|e| ApiError::BadRequest(format!("invalid order body: {e}")))?;
+
+    // Authenticate the app (read-only, outside the Execute transaction).
+    let app = {
+        let mut conn = store::get_conn(&pool)?;
+        store::find_app_by_token(&mut conn, &app_token).map_err(|_| ApiError::Unauthorized)?
+    };
 
     // Exact decimal-string -> integer base units (no f64 round-trip).
     let price_amount_base_units = store::parse_base_units(&req.price_amount, USDC_DECIMALS)
         .map_err(|e| ApiError::BadRequest(format!("invalid price_amount: {e}")))?;
 
-    let order = Order {
-        id,
-        app_id: Some(app.id),
-        order_id: req.order_id.clone(),
-        price_amount: price_amount_base_units,
-        price_currency: req.price_currency.clone(),
-        receive_currency: req.receive_currency.clone(),
-        memo_id: memo_id.clone(),
-        status: "pending".to_string(),
-        tx_hash: None,
-        selected_mint: None,
-        expected_amount: None,
-        expected_decimals: None,
-        callback_url: req.callback_url.clone(),
-        success_url: req.success_url.clone(),
-        cancel_url: req.cancel_url.clone(),
-        created_at: None,
-        confirmed_at: None,
-    };
+    let idem_store = store::IdempotencyStorePg::new(pool.get_ref().clone());
+    let one_token = BigDecimal::from(10_u64.pow(USDC_DECIMALS));
 
-    let inserted = store::insert_order(&mut conn, order)
-        .map_err(|e| ApiError::Internal(format!("insert order: {e}")))?;
-    Ok(HttpResponse::Ok().json(CreateOrderResponse {
-        id: inserted.id.to_string(),
-        payment_url,
-        memo_id,
-        status: inserted.status,
-        amount: req.price_amount.clone(),
-        receive_currency: inserted.receive_currency,
-    }))
+    crate::idem::execute_idempotent(&idem_store, pool.get_ref(), &key, &fingerprint, |conn| {
+        // The effect: insert the order with the `(app_id, order_id)` natural-key backstop, so
+        // two distinct idempotency keys for the same business order converge on one row.
+        let candidate = Order {
+            id: Uuid::new_v4(),
+            app_id: Some(app.id),
+            order_id: req.order_id.clone(),
+            price_amount: price_amount_base_units.clone(),
+            price_currency: req.price_currency.clone(),
+            receive_currency: req.receive_currency.clone(),
+            memo_id: Uuid::new_v4().to_string(),
+            status: "pending".to_string(),
+            tx_hash: None,
+            selected_mint: None,
+            expected_amount: None,
+            expected_decimals: None,
+            callback_url: req.callback_url.clone(),
+            success_url: req.success_url.clone(),
+            cancel_url: req.cancel_url.clone(),
+            created_at: None,
+            confirmed_at: None,
+        };
+
+        let order = store::insert_order_on_conflict(conn, candidate)?;
+
+        // Snapshot reflects the REAL order row; amount echoed as the human decimal string.
+        let response = CreateOrderResponse {
+            id: order.id.to_string(),
+            payment_url: format!("https://pay.gateway.com/pay/{}", order.id),
+            memo_id: order.memo_id.clone(),
+            status: order.status.clone(),
+            amount: (order.price_amount.clone() / one_token.clone()).to_string(),
+            receive_currency: order.receive_currency.clone(),
+        };
+        Ok((response, 200))
+    })
 }
 
 #[get("/orders/{id}")]

@@ -17,21 +17,36 @@ pub enum CrashPointId {
     /// Phase 0 canary only — proves the abort/supervisor model. Has a fire-site solely in the
     /// self-test, never in real code.
     SelfTest,
-    // Phase 1 will append, e.g.:
-    // ProcessorAfterDepositInsertBeforeCredit, ProcessorAfterCreditBeforeOrderPaid,
-    // ProcessorAfterCommitBeforeXack, IdemAfterEffectBeforeComplete,
-    // WorkerAfterSendBeforeXack, RelayAfterXaddBeforeMarkSent, ...
+
+    // ── Phase 1, Session 1.2: the inbound-key Execute spine (api) ──────────────────────────
+    /// Between `acquire` returning `Acquired` (or a won takeover) and opening the Execute
+    /// `with_tx`. A crash here commits nothing — recovery sees the `in_progress` key.
+    IdemAfterAcquireBeforeExecute,
+    /// Inside the Execute `with_tx`, after the guarded effect ran but before the conditional
+    /// `complete` flip. A crash here rolls the effect back (neither effect nor completion commit).
+    IdemAfterEffectBeforeComplete,
+    /// Inside the Execute `with_tx`, after `complete` won but before COMMIT. A crash here still
+    /// rolls everything back — `status='completed'` iff the commit landed.
+    IdemAfterCompleteBeforeCommit,
 }
 
 impl CrashPointId {
     /// Every crash point, for enumeration by the Phase 2 harness.
-    pub const ALL: &'static [CrashPointId] = &[CrashPointId::SelfTest];
+    pub const ALL: &'static [CrashPointId] = &[
+        CrashPointId::SelfTest,
+        CrashPointId::IdemAfterAcquireBeforeExecute,
+        CrashPointId::IdemAfterEffectBeforeComplete,
+        CrashPointId::IdemAfterCompleteBeforeCommit,
+    ];
 
     /// Stable string name used to arm a point via `COINGATE_CHAOS_FIRE`. Must round-trip
     /// with [`CrashPointId::from_name`].
     pub fn name(self) -> &'static str {
         match self {
             CrashPointId::SelfTest => "SelfTest",
+            CrashPointId::IdemAfterAcquireBeforeExecute => "IdemAfterAcquireBeforeExecute",
+            CrashPointId::IdemAfterEffectBeforeComplete => "IdemAfterEffectBeforeComplete",
+            CrashPointId::IdemAfterCompleteBeforeCommit => "IdemAfterCompleteBeforeCommit",
         }
     }
 
@@ -82,8 +97,13 @@ mod tests_without_chaos {
     #[test]
     fn crash_point_is_a_noop_without_the_feature() {
         crash_point!(CrashPointId::SelfTest);
-        assert_eq!(CrashPointId::ALL.len(), 1);
+        // Phase 0 shipped 1 variant; Session 1.2 appended 3 (the Execute-spine seams).
+        assert_eq!(CrashPointId::ALL.len(), 4);
         assert_eq!(CrashPointId::SelfTest.name(), "SelfTest");
+        // Names round-trip and are unique (a registry-closure precondition the Phase 2 harness relies on).
+        for id in CrashPointId::ALL {
+            assert!(!id.name().is_empty());
+        }
     }
 }
 

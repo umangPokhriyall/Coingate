@@ -98,6 +98,31 @@ pub fn insert_order(conn: &mut PgConnection, order: Order) -> Result<Order, Erro
         .get_result(conn)
 }
 
+/// The natural-key backstop for `/orders` (Phase 1 §4): `INSERT ... ON CONFLICT (app_id,
+/// order_id) DO NOTHING RETURNING`. If a row is returned it is the newly-created order; if no
+/// row (a prior order with this `(app_id, order_id)` already exists), `SELECT` and return it.
+/// Either way the result reflects the one real order, so two distinct idempotency keys for the
+/// same business order converge on a single row. MUST be called inside `with_tx`.
+pub fn insert_order_on_conflict(conn: &mut PgConnection, order: Order) -> Result<Order, Error> {
+    use crate::schema::orders::dsl::*;
+
+    let inserted: Option<Order> = diesel::insert_into(orders)
+        .values(&order)
+        .on_conflict((app_id, order_id))
+        .do_nothing()
+        .returning(Order::as_returning())
+        .get_result(conn)
+        .optional()?;
+
+    match inserted {
+        Some(o) => Ok(o),
+        None => orders
+            .filter(app_id.eq(order.app_id).and(order_id.eq(&order.order_id)))
+            .select(Order::as_select())
+            .first(conn),
+    }
+}
+
 pub fn find_order(conn: &mut PgConnection, oid: Uuid) -> Result<Order, Error> {
     use crate::schema::orders::dsl::*;
     orders

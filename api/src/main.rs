@@ -4,6 +4,7 @@ use store::{build_pool, Config, Pool};
 use tracing_subscriber::EnvFilter;
 
 mod error;
+mod idem;
 mod routes;
 use routes::merchant::{
     create_app, create_order, get_merchant, list_apps, set_jwt_secret, sign_in, sign_up, get_order,

@@ -16,3 +16,6 @@ bigdecimal = { version = "0.4", features = ["serde"] }
 argon2 = "0.5.3"
 bcrypt = "0.17.1"
 thiserror = "2"
+
+# Sans-IO idempotency core (Phase 1). `store` provides the Postgres `IdempotencyStore` impl.
+idempotency = { path = "../idempotency" }
