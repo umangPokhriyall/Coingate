@@ -224,6 +224,46 @@ pub fn insert_deposit(conn: &mut PgConnection, mut dep: Deposit) -> Result<Depos
     }
 }
 
+/// Atomic-credit dedup oracle (Phase 1 §5): `INSERT ... ON CONFLICT (tx_hash) DO NOTHING
+/// RETURNING`. `Some(row)` is a first-time confirmed delivery (credit it); `None` means this
+/// signature was already inserted (a duplicate delivery — credit NOTHING). MUST be called inside
+/// `with_tx` so the dedup and the credit it gates commit together.
+pub fn insert_deposit_on_conflict(
+    conn: &mut PgConnection,
+    mut dep: Deposit,
+) -> Result<Option<Deposit>, Error> {
+    use crate::schema::deposits::dsl::*;
+    if dep.created_at.is_none() {
+        dep.created_at = Some(Utc::now().naive_utc());
+    }
+    diesel::insert_into(deposits)
+        .values(&dep)
+        .on_conflict(tx_hash)
+        .do_nothing()
+        .returning(Deposit::as_returning())
+        .get_result(conn)
+        .optional()
+}
+
+/// Lifecycle-guarded mark-paid (Phase 1 §5): `UPDATE orders SET status='paid', tx_hash=?,
+/// confirmed_at=now() WHERE id=? AND status<>'paid'`. Returns rows affected (0 if already paid).
+/// The `status<>'paid'` predicate is the atomic backstop behind `order_can_mark_paid`. MUST be
+/// called inside `with_tx`.
+pub fn mark_order_paid(
+    conn: &mut PgConnection,
+    order_id_: Uuid,
+    tx_hash_: &str,
+) -> Result<usize, Error> {
+    use crate::schema::orders::dsl::*;
+    diesel::update(orders.filter(id.eq(order_id_)).filter(status.ne("paid")))
+        .set((
+            status.eq("paid"),
+            tx_hash.eq(Some(tx_hash_.to_string())),
+            confirmed_at.eq(Some(Utc::now().naive_utc())),
+        ))
+        .execute(conn)
+}
+
 pub fn mark_deposit_processed(
     conn: &mut PgConnection,
     txhash: &str,
@@ -490,6 +530,27 @@ pub fn finalize_withdrawal_success(
         .execute(conn)?;
 
     Ok(updated_wd)
+}
+
+// === Dead letter (poison-message sink, Brief §3.7) ===
+/// Record a stream entry that cannot become a valid credit (no matching order, verification
+/// failure, or a parse failure) instead of silently dropping it. The caller XACKs after this
+/// commits, so nothing is lost.
+pub fn insert_dead_letter(
+    conn: &mut PgConnection,
+    source_stream_: &str,
+    raw_: &serde_json::Value,
+    reason_: &str,
+) -> Result<DeadLetter, Error> {
+    use crate::schema::dead_letter::dsl::*;
+    diesel::insert_into(dead_letter)
+        .values((
+            source_stream.eq(source_stream_),
+            raw.eq(raw_.clone()),
+            reason.eq(reason_),
+        ))
+        .returning(DeadLetter::as_returning())
+        .get_result(conn)
 }
 
 // On failure: set withdrawal.status = failed and restore locked->balance.

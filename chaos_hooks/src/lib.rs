@@ -28,6 +28,18 @@ pub enum CrashPointId {
     /// Inside the Execute `with_tx`, after `complete` won but before COMMIT. A crash here still
     /// rolls everything back — `status='completed'` iff the commit landed.
     IdemAfterCompleteBeforeCommit,
+
+    // ── Phase 1, Session 1.3: the atomic credit (processor) ────────────────────────────────
+    /// Inside the credit `with_tx`, after the deposit INSERT-on-conflict but before the balance
+    /// credit. A crash here commits nothing (the deposit row rolls back with the credit).
+    ProcAfterDepositInsertBeforeCredit,
+    /// Inside the credit `with_tx`, after the balance credit but before mark-order-paid.
+    ProcAfterCreditBeforeOrderPaid,
+    /// Inside the credit `with_tx`, after mark-order-paid but before COMMIT.
+    ProcAfterOrderPaidBeforeCommit,
+    /// After the credit `with_tx` committed but before the stream XACK. A crash here redelivers
+    /// the entry; the `UNIQUE(tx_hash)` dedup absorbs it (credit-nothing on the duplicate).
+    ProcAfterCommitBeforeXack,
 }
 
 impl CrashPointId {
@@ -37,6 +49,10 @@ impl CrashPointId {
         CrashPointId::IdemAfterAcquireBeforeExecute,
         CrashPointId::IdemAfterEffectBeforeComplete,
         CrashPointId::IdemAfterCompleteBeforeCommit,
+        CrashPointId::ProcAfterDepositInsertBeforeCredit,
+        CrashPointId::ProcAfterCreditBeforeOrderPaid,
+        CrashPointId::ProcAfterOrderPaidBeforeCommit,
+        CrashPointId::ProcAfterCommitBeforeXack,
     ];
 
     /// Stable string name used to arm a point via `COINGATE_CHAOS_FIRE`. Must round-trip
@@ -47,6 +63,10 @@ impl CrashPointId {
             CrashPointId::IdemAfterAcquireBeforeExecute => "IdemAfterAcquireBeforeExecute",
             CrashPointId::IdemAfterEffectBeforeComplete => "IdemAfterEffectBeforeComplete",
             CrashPointId::IdemAfterCompleteBeforeCommit => "IdemAfterCompleteBeforeCommit",
+            CrashPointId::ProcAfterDepositInsertBeforeCredit => "ProcAfterDepositInsertBeforeCredit",
+            CrashPointId::ProcAfterCreditBeforeOrderPaid => "ProcAfterCreditBeforeOrderPaid",
+            CrashPointId::ProcAfterOrderPaidBeforeCommit => "ProcAfterOrderPaidBeforeCommit",
+            CrashPointId::ProcAfterCommitBeforeXack => "ProcAfterCommitBeforeXack",
         }
     }
 
@@ -97,8 +117,8 @@ mod tests_without_chaos {
     #[test]
     fn crash_point_is_a_noop_without_the_feature() {
         crash_point!(CrashPointId::SelfTest);
-        // Phase 0 shipped 1 variant; Session 1.2 appended 3 (the Execute-spine seams).
-        assert_eq!(CrashPointId::ALL.len(), 4);
+        // Phase 0 shipped 1 variant; 1.2 appended 3 (Execute spine), 1.3 appended 4 (atomic credit).
+        assert_eq!(CrashPointId::ALL.len(), 8);
         assert_eq!(CrashPointId::SelfTest.name(), "SelfTest");
         // Names round-trip and are unique (a registry-closure precondition the Phase 2 harness relies on).
         for id in CrashPointId::ALL {

@@ -3346,8 +3346,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bigdecimal",
+ "chaos_hooks",
  "chrono",
  "dotenv",
+ "idempotency",
  "redis",
  "serde",
  "serde_json",
