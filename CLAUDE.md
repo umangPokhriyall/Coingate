@@ -1,23 +1,38 @@
 ## Authoritative specs
 - docs/specs/kickoff-brief.md         — strategy, the audit, the primitives, the DoD
 - docs/specs/kickoff-amendment-1.md   — chaos enumeration, in-progress key protocol, RC proof
-- docs/specs/phase0-spec.md           — CURRENT: substrate, traits, schema baseline, chaos scaffolding
+- docs/specs/phase0-spec.md           — substrate, traits, schema baseline, chaos scaffolding (DONE)
+- docs/specs/phase1-spec.md           — the idempotency core (DONE)
+- docs/specs/phase2-spec.md           — the proof (DONE)
 
-## Hard rules (Phase 0)
-1. NO idempotency logic, NO credit-path atomicity rewrite, NO worker reconciliation,
-   NO outbox relay, NO chaos harness. Those are Phase 1/2. Phase 0 makes them buildable.
-2. The ONLY transaction constructor is store::with_tx, pinned to READ COMMITTED. No other path
-   opens a transaction or sets an isolation level.
-3. No Arc<Mutex<Store>>. Pool only. No f64 on money. No .unwrap()/.expect() on request/stream/RPC
-   data — typed errors or dead-letter.
-4. No println!/eprintln!. tracing only.
-5. Signer::send MUST take the idempotency key (withdrawal_id) now, even though the worker does not
-   reconcile until Phase 1. Trait signatures + with_tx + schema baseline are FROZEN after Phase 0.
-6. chaos code lives behind the `chaos` cargo feature and MUST compile to nothing by default.
-   CrashPointId is append-only.
-7. Phase 0 deps only: diesel(r2d2,postgres,numeric,uuid,chrono,serde_json), r2d2, thiserror,
-   tracing, tracing-subscriber. Nothing else.
+## Status
+Phase 2 complete. The artifact is `chaos/results/` (the exhaustive crash-point sweep + the
+before/after table), the teardown is `docs/DESIGN.md`, the state machines are `docs/LIFECYCLE.md`,
+and `README.md` reframes the repo as an exactly-once core. See `chaos/results/summary.md` for the
+headline (62/62, 0 conservation violations, 1 send per withdrawal, at READ COMMITTED).
+
+## Hard rules (Phase 2)
+1. NO product-logic change, NO DDL, NO new CrashPointId (closed at 15). Phase 2 only proves.
+2. Do not touch any frozen contract: with_tx + READ COMMITTED, Chain/Signer, schema baseline,
+   the Execute spine, the atomic-credit shape, the worker state machine.
+3. The harness is BLACK-BOX: it spawns the real binaries and asserts via DB + reconciler +
+   mock-mpc counts. It must not link target crates. This is what lets it run on legacy too.
+4. The whole proof runs at READ COMMITTED. Never raise the isolation level. Record the level
+   in every run record (Amendment §A4).
+5. The crash-point axis is EXHAUSTIVE (every variant × every schedule). The interleaving sweep
+   is seeded — state that boundary honestly in DESIGN.md; do not overclaim exhaustiveness there.
+6. Build DESIGN.md ONLY from committed chaos/results/ numbers. No marketing language. Keep the
+   pre-idempotency baseline runnable; show the bug, then show it gone.
+7. Provisioning: the sudo block in phase2-spec §3.1 is operator-run; everything else the agent runs.
+
+## Exception on record (Phase 2.1)
+external::MpcSigner::lookup was wired to the mock-mpc GET /lookup endpoint (and the worker builds the
+lookup URL from cfg.mpc_base_url). The Phase-1 stub returned None, so the real worker re-sent on a
+crash between send and finalize. This completes the mocked-I/O adapter the spec's /lookup endpoint
+was built for; the trait signature, worker state machine, schema, with_tx, and atomic-credit shape
+are unchanged.
 
 ## Scope discipline
-One session = one deliverable. End each with cargo build + clippy + test (and
-`cargo test --features chaos` for 0.5), list changes, STOP.
+One session = one deliverable. End with cargo build + clippy + test green, list changes, STOP.
+2.0 = substrate up; 2.1 = sweep green + committed; 2.2 = before/after committed; 2.3 = DESIGN/
+LIFECYCLE sourced; 2.4 = README + DoD reported.
