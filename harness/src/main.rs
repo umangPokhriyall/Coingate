@@ -31,8 +31,47 @@ fn main() -> Result<()> {
         Some("selftest") => selftest(),
         Some("smoke") => smoke(),
         Some("sweep") | None => sweep(),
-        Some(other) => bail!("unknown subcommand '{other}' (`selftest` | `smoke` | `sweep`)"),
+        Some("before-after") => before_after(),
+        Some(other) => {
+            bail!("unknown subcommand '{other}' (`selftest` | `smoke` | `sweep` | `before-after`)")
+        }
     }
+}
+
+/// Session 2.2: point the identical harness at the instrumented `pre-idempotency-chaos` legacy
+/// build and capture the legacy violations, then emit `before-after.md` + `sweep-pre-idempotency.jsonl`.
+fn before_after() -> Result<()> {
+    let env = Env::load()?;
+    let legacy_bin_dir = std::env::var("COINGATE_LEGACY_BIN_DIR")
+        .unwrap_or_else(|_| "/home/umang/rust/legacy-target/debug".to_string());
+
+    // The legacy worker's MPC URL is hardcoded to :3000 — run a mock-mpc there so its send counter
+    // can be read (the rebuilt worker uses MPC_BASE_URL/:8090).
+    let legacy_mpc_addr = "127.0.0.1:3000";
+    let legacy_mpc_base = "http://127.0.0.1:3000";
+    let mock = Target::new("mock-mpc", sibling_bin("mock-mpc")?).with_env("MOCK_MPC_ADDR", legacy_mpc_addr);
+    let mut mock_proc = spawn(&mock, None)?;
+    if !wait_for_port(legacy_mpc_addr, Duration::from_secs(10)) {
+        let _ = mock_proc.kill();
+        bail!("legacy mock-mpc never bound {legacy_mpc_addr}");
+    }
+
+    let mut ctx = Ctx::new(env)?;
+    ctx.service_bin_dir = Some(std::path::PathBuf::from(&legacy_bin_dir));
+    let result = harness::beforeafter::run(&mut ctx, legacy_mpc_base);
+    let _ = mock_proc.kill();
+    let records = result?;
+
+    let jsonl = Path::new("chaos/results/sweep-pre-idempotency.jsonl");
+    let table = Path::new("chaos/results/before-after.md");
+    write_jsonl(jsonl, &records)?;
+    harness::beforeafter::write_before_after_md(table, &records)?;
+
+    for r in &records {
+        info!(crash_point = %r.crash_point, captured = !r.passed(), note = %r.note, violations = ?r.violations, "legacy run");
+    }
+    info!("wrote chaos/results/before-after.md + sweep-pre-idempotency.jsonl");
+    Ok(())
 }
 
 /// Fast smoke check (one run per owner + §A2/§A3 + one seed) — not committed, just for bring-up.

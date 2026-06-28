@@ -9,6 +9,7 @@
 //! counts. The one in-workspace dependency is `chaos_hooks` — the crash-point registry it
 //! iterates by name.
 
+pub mod beforeafter;
 pub mod enumerate;
 pub mod fixtures;
 pub mod oracles;

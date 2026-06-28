@@ -59,6 +59,9 @@ pub struct Ctx {
     pub redis: Redis,
     pub cwd: PathBuf,
     pub reconciler_bin: PathBuf,
+    /// When set (Session 2.2 before-run), the api/processor/worker/relay binaries are spawned
+    /// from this dir (the instrumented legacy build) instead of next to the harness.
+    pub service_bin_dir: Option<PathBuf>,
 }
 
 impl Ctx {
@@ -67,21 +70,32 @@ impl Ctx {
         let redis = Redis::connect(&env.redis_url)?;
         let cwd = std::env::current_dir()?;
         let reconciler_bin = sibling_bin("reconciler")?;
-        Ok(Ctx { env, db, redis, cwd, reconciler_bin })
+        Ok(Ctx { env, db, redis, cwd, reconciler_bin, service_bin_dir: None })
     }
 
-    fn target(&self, name: &str) -> Result<Target> {
-        Ok(Target::new(name, sibling_bin(name)?).with_cwd(&self.cwd))
+    /// Resolve a service binary: from `service_bin_dir` if set (legacy), else next to the harness.
+    pub fn target(&self, name: &str) -> Result<Target> {
+        let bin = match &self.service_bin_dir {
+            Some(dir) => {
+                let p = dir.join(name);
+                if !p.exists() {
+                    bail!("service binary not found: {}", p.display());
+                }
+                p
+            }
+            None => sibling_bin(name)?,
+        };
+        Ok(Target::new(name, bin).with_cwd(&self.cwd))
     }
 
     /// Reset DB + Redis to a clean slate (mock-mpc counts persist but keys are unique per run).
-    fn reset(&mut self) -> Result<()> {
+    pub fn reset(&mut self) -> Result<()> {
         self.db.truncate_all()?;
         self.redis.flush_and_recreate_groups()?;
         Ok(())
     }
 
-    fn core(&self, replay_merchant: Option<(Uuid, usize)>) -> Result<Vec<String>> {
+    pub fn core(&self, replay_merchant: Option<(Uuid, usize)>) -> Result<Vec<String>> {
         let mut v = oracles::check_core(&self.db, &self.env, &self.reconciler_bin, &self.cwd)?;
         if let Some((m, expected)) = replay_merchant {
             v.extend(oracles::replay_safety_withdrawals(&self.db, m, expected)?);

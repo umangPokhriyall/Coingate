@@ -231,14 +231,61 @@ pub fn reconciler_clean(reconciler_bin: &Path, cwd: &Path) -> Result<Vec<String>
 
 /// GET mock-mpc `/__counts` → per-key send counts.
 fn mock_counts(env: &Env) -> Result<HashMap<String, i64>> {
-    let url = format!("{}/__counts", env.mpc_base_url.trim_end_matches('/'));
-    let resp: HashMap<String, i64> = reqwest::blocking::Client::new()
+    mock_counts_at(&env.mpc_base_url)
+}
+
+/// GET `/__counts` from an arbitrary mock-mpc base URL (the legacy worker hardcodes a different
+/// port, so Session 2.2 reads its counter from there).
+pub fn mock_counts_at(base: &str) -> Result<HashMap<String, i64>> {
+    let url = format!("{}/__counts", base.trim_end_matches('/'));
+    reqwest::blocking::Client::new()
         .get(&url)
         .send()
         .context("GET /__counts")?
         .json()
-        .context("parse /__counts")?;
-    Ok(resp)
+        .context("parse /__counts")
+}
+
+/// Read `(available, locked)` base units for `(merchant, token)` (0,0 if no row). Used by the
+/// Session 2.2 before-run to detect the legacy double-credit / double-lock directly.
+pub fn balance_of(db: &Db, merchant: uuid::Uuid, token: &str) -> Result<(i64, i64)> {
+    #[derive(QueryableByName)]
+    struct B {
+        #[diesel(sql_type = BigInt)]
+        available: i64,
+        #[diesel(sql_type = BigInt)]
+        locked: i64,
+    }
+    let rows: Vec<B> = db.with_conn(|c| {
+        sql_query(
+            "SELECT COALESCE(balance,0)::bigint AS available, COALESCE(locked_balance,0)::bigint AS locked \
+             FROM balances WHERE merchant_id = $1::uuid AND token_mint = $2",
+        )
+        .bind::<Text, _>(merchant.to_string())
+        .bind::<Text, _>(token.to_string())
+        .load(c)
+    })?;
+    Ok(rows.first().map(|b| (b.available, b.locked)).unwrap_or((0, 0)))
+}
+
+/// Count withdrawal rows for a merchant (replay-safety / double-lock signal).
+pub fn withdrawal_count(db: &Db, merchant: uuid::Uuid) -> Result<i64> {
+    let r: CountRow = db.with_conn(|c| {
+        sql_query("SELECT COUNT(*) AS n FROM withdrawals WHERE merchant_id = $1::uuid")
+            .bind::<Text, _>(merchant.to_string())
+            .get_result(c)
+    })?;
+    Ok(r.n)
+}
+
+/// Count `pending` withdrawals for a merchant (stranded-funds signal when no stream entry exists).
+pub fn pending_withdrawal_count(db: &Db, merchant: uuid::Uuid) -> Result<i64> {
+    let r: CountRow = db.with_conn(|c| {
+        sql_query("SELECT COUNT(*) AS n FROM withdrawals WHERE merchant_id = $1::uuid AND status = 'pending'")
+            .bind::<Text, _>(merchant.to_string())
+            .get_result(c)
+    })?;
+    Ok(r.n)
 }
 
 /// Run the four always-checkable oracles (#1, #2, #4, #5). Replay-safety (#3) is asserted by the
