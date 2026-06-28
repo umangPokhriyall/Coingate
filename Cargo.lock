@@ -2074,14 +2074,18 @@ name = "harness"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chaos_hooks",
  "diesel",
  "dotenv",
+ "rand 0.8.5",
  "redis",
  "reqwest",
  "serde_json",
+ "sha2 0.10.9",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

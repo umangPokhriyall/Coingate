@@ -21,6 +21,11 @@ anyhow = "1.0"
 dotenv = "0.15"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Session 2.1: seeded interleaving sweep + black-box workload driving.
+rand = "0.8"               # seeded RNG (fixed, committed seeds)
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"              # HMAC-SHA256 for minting the merchant JWT (HS256) the api expects
+base64 = "0.22"           # base64url for the JWT
 
 [features]
 # Builds the `chaos_canary` throwaway with live crash-point fire-sites. The supervisor itself

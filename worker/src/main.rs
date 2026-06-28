@@ -132,12 +132,12 @@ async fn main() -> Result<()> {
     let mut db = get_conn(&pool).expect("failed to get DB connection");
     let fat_wallet = store::get_fat_wallet(&mut db).expect("fat wallet not configured");
     drop(db);
-    let send_url = format!(
-        "{}/wallets/{}/send",
-        cfg.mpc_base_url.trim_end_matches('/'),
-        fat_wallet.id
-    );
-    let signer = MpcSigner::new(send_url);
+    let mpc_base = cfg.mpc_base_url.trim_end_matches('/');
+    let send_url = format!("{}/wallets/{}/send", mpc_base, fat_wallet.id);
+    // Reconciliation endpoint (Phase 2 §3.3): the worker calls this from `processing` instead of
+    // re-sending, so a crash between send and finalize does not cause a second send.
+    let lookup_url = format!("{}/lookup", mpc_base);
+    let signer = MpcSigner::new(send_url, lookup_url);
 
     let group = "withdrawals_group";
     let consumer = format!("withdrawer-{}", uuid::Uuid::new_v4());

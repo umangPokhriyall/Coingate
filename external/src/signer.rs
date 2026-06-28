@@ -44,17 +44,23 @@ pub trait Signer {
 // ===================== Real impl =====================
 
 /// Forwards `key` to the MPC `/send` endpoint as `idempotency_key`, documenting the dedup
-/// contract the real signer MUST honor. Untouched beyond wrapping the existing HTTP call.
+/// contract the real signer MUST honor. `lookup` queries the MPC's reconciliation endpoint so a
+/// redelivered `processing` withdrawal is reconciled (prior signature returned) rather than
+/// re-sent — the effect-boundary at-most-once guarantee (Phase 2 §3.3; the mock-mpc `/lookup`
+/// exists for exactly this path).
 pub struct MpcSigner {
     /// Full per-wallet send URL, e.g. `http://127.0.0.1:3000/wallets/<id>/send`.
     send_url: String,
+    /// Reconciliation endpoint, e.g. `http://127.0.0.1:3000/lookup`; queried as `?key=<id>`.
+    lookup_url: String,
     http: reqwest::Client,
 }
 
 impl MpcSigner {
-    pub fn new(send_url: String) -> Self {
+    pub fn new(send_url: String, lookup_url: String) -> Self {
         Self {
             send_url,
+            lookup_url,
             http: reqwest::Client::new(),
         }
     }
@@ -99,9 +105,37 @@ impl Signer for MpcSigner {
             .map_err(|e| SignerError::InvalidSignature(e.to_string()))
     }
 
-    async fn lookup(&self, _key: Uuid) -> Result<Option<Signature>, SignerError> {
-        // Phase 0: the MPC reconciliation endpoint is not wired yet (Phase 1.4).
-        Ok(None)
+    async fn lookup(&self, key: Uuid) -> Result<Option<Signature>, SignerError> {
+        // Query the MPC reconciliation endpoint WITHOUT performing a send. A transport/non-success
+        // failure is ambiguous, so it surfaces as `Transport` — the worker then leaves the
+        // withdrawal `processing` and retries on the next redelivery (never blind-sends).
+        let resp = self
+            .http
+            .get(&self.lookup_url)
+            .query(&[("key", key.to_string())])
+            .send()
+            .await
+            .map_err(|e| SignerError::Transport(e.to_string()))?;
+
+        if !resp.status().is_success() {
+            return Err(SignerError::Transport(format!(
+                "lookup returned status {}",
+                resp.status()
+            )));
+        }
+
+        let json: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| SignerError::Transport(e.to_string()))?;
+        // `{ "signature": null }` → never sent (None); `{ "signature": "<base58>" }` → prior send.
+        match json.get("signature").and_then(|s| s.as_str()) {
+            None => Ok(None),
+            Some(sig_str) => sig_str
+                .parse::<Signature>()
+                .map(Some)
+                .map_err(|e| SignerError::InvalidSignature(e.to_string())),
+        }
     }
 }
 

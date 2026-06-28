@@ -69,6 +69,16 @@ impl Db {
         self.pool.get().context("check out DB connection")
     }
 
+    /// Lend a raw connection for black-box seeding/reading (raw SQL only — never the `store`
+    /// schema). Used by `workload`/`oracles` to set up preconditions and read invariants.
+    pub fn with_conn<T>(
+        &self,
+        f: impl FnOnce(&mut PgConnection) -> Result<T, diesel::result::Error>,
+    ) -> Result<T> {
+        let mut conn = self.conn()?;
+        Ok(f(&mut conn)?)
+    }
+
     /// Truncate every business table to a clean slate (faster + more deterministic than a
     /// per-run database — §3.3). `RESTART IDENTITY CASCADE`.
     pub fn truncate_all(&self) -> Result<()> {
@@ -162,6 +172,51 @@ impl Redis {
         Ok(())
     }
 
+    /// Raw connection for ad-hoc commands (enqueue, XADD) the workload driver needs.
+    pub fn raw(&mut self) -> &mut redis::Connection {
+        &mut self.conn
+    }
+
+    /// `XADD <stream> * <field value>...` — append one entry, returning its id.
+    pub fn xadd(&mut self, stream: &str, fields: &[(&str, &str)]) -> Result<String> {
+        let mut cmd = redis::cmd("XADD");
+        cmd.arg(stream).arg("*");
+        for (k, v) in fields {
+            cmd.arg(*k).arg(*v);
+        }
+        let id: String = cmd.query(&mut self.conn).with_context(|| format!("XADD {stream}"))?;
+        Ok(id)
+    }
+
+    /// Reclaim every pending entry on `(stream, group)` to a throwaway harness consumer (min-idle
+    /// 0) and `XACK` it — clearing a crashed consumer's stranded PEL so the run can reach
+    /// quiescence without waiting out the services' 60s `XAUTOCLAIM` idle window. Returns the
+    /// number of entries cleared. (The redelivery itself is then modeled by re-`XADD` — see
+    /// `workload::redeliver`.)
+    pub fn reclaim_and_ack(&mut self, stream: &str, group: &str) -> Result<usize> {
+        let claimed: redis::Value = redis::cmd("XAUTOCLAIM")
+            .arg(stream)
+            .arg(group)
+            .arg("harness-reaper")
+            .arg(0)
+            .arg("0-0")
+            .arg("COUNT")
+            .arg(1000)
+            .query(&mut self.conn)
+            .with_context(|| format!("XAUTOCLAIM {stream}"))?;
+        // XAUTOCLAIM reply: [cursor, [[id, [fields...]], ...], [deleted...]]. Pull the ids.
+        let ids = autoclaim_ids(&claimed);
+        for id in &ids {
+            let _: () = redis::cmd("XACK")
+                .arg(stream)
+                .arg(group)
+                .arg(id)
+                .query(&mut self.conn)
+                .with_context(|| format!("XACK {stream} {id}"))?;
+        }
+        Ok(ids.len())
+    }
+
     /// Number of entries currently in a stream (`XLEN`).
     pub fn xlen(&mut self, stream: &str) -> Result<i64> {
         let len: i64 = redis::cmd("XLEN")
@@ -213,6 +268,25 @@ impl Redis {
         }
         Ok(true)
     }
+}
+
+/// Extract the entry ids from an `XAUTOCLAIM` reply (`[cursor, [[id, fields], ...], [...]]`).
+fn autoclaim_ids(v: &redis::Value) -> Vec<String> {
+    let mut ids = Vec::new();
+    if let redis::Value::Bulk(top) = v
+        && top.len() >= 2
+        && let redis::Value::Bulk(entries) = &top[1]
+    {
+        for entry in entries {
+            if let redis::Value::Bulk(pair) = entry
+                && let Some(redis::Value::Data(id)) = pair.first()
+                && let Ok(s) = std::str::from_utf8(id)
+            {
+                ids.push(s.to_string());
+            }
+        }
+    }
+    ids
 }
 
 /// Parse a Redis integer-ish value (`Int`, or a numeric `Data` bulk) to `i64`.

@@ -7,11 +7,15 @@
 //!   cargo build -p harness --features chaos -p mock-mpc -p api
 //!   target/debug/harness selftest
 
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use harness::enumerate::Ctx;
 use harness::fixtures::{Db, Redis, quiescent};
+use harness::report::{write_jsonl, write_summary};
 use harness::supervisor::{Exit, Target, all_crash_point_names, sibling_bin, spawn, wait_for_port};
+use harness::workload::Env;
 use tracing::info;
 
 fn main() -> Result<()> {
@@ -24,9 +28,87 @@ fn main() -> Result<()> {
     dotenv::dotenv().ok();
 
     match std::env::args().nth(1).as_deref() {
-        Some("selftest") | None => selftest(),
-        Some(other) => bail!("unknown subcommand '{other}' (Session 2.0 ships only `selftest`)"),
+        Some("selftest") => selftest(),
+        Some("smoke") => smoke(),
+        Some("sweep") | None => sweep(),
+        Some(other) => bail!("unknown subcommand '{other}' (`selftest` | `smoke` | `sweep`)"),
     }
+}
+
+/// Fast smoke check (one run per owner + §A2/§A3 + one seed) — not committed, just for bring-up.
+fn smoke() -> Result<()> {
+    let env = Env::load()?;
+    let mpc_addr = env.mpc_authority();
+    let mock = Target::new("mock-mpc", sibling_bin("mock-mpc")?).with_env("MOCK_MPC_ADDR", &mpc_addr);
+    let mut mock_proc = spawn(&mock, None)?;
+    if !wait_for_port(&mpc_addr, Duration::from_secs(10)) {
+        let _ = mock_proc.kill();
+        bail!("mock-mpc never bound {mpc_addr}");
+    }
+    let mut ctx = Ctx::new(env)?;
+    let result = harness::enumerate::run_smoke(&mut ctx);
+    let _ = mock_proc.kill();
+    let records = result?;
+    let mut failed = false;
+    for r in &records {
+        if r.passed() {
+            info!(crash_point = %r.crash_point, schedule = %r.schedule, aborted = r.aborted, "PASS");
+        } else {
+            failed = true;
+            info!(crash_point = %r.crash_point, schedule = %r.schedule, aborted = r.aborted, violations = ?r.violations, "FAIL");
+        }
+    }
+    if failed {
+        bail!("smoke failures");
+    }
+    Ok(())
+}
+
+/// The Session 2.1 deliverable: the exhaustive crash-point × schedule sweep + §A2/§A3 + the
+/// seeded interleaving sweep, all at READ COMMITTED, written to `chaos/results/`.
+fn sweep() -> Result<()> {
+    let env = Env::load()?;
+    let mpc_addr = env.mpc_authority();
+
+    // mock-mpc runs for the whole sweep (never armed); the worker reconciles against it.
+    let mock = Target::new("mock-mpc", sibling_bin("mock-mpc")?).with_env("MOCK_MPC_ADDR", &mpc_addr);
+    let mut mock_proc = spawn(&mock, None)?;
+    if !wait_for_port(&mpc_addr, Duration::from_secs(10)) {
+        let _ = mock_proc.kill();
+        bail!("mock-mpc never bound {mpc_addr}");
+    }
+
+    let mut ctx = Ctx::new(env)?;
+    let names = all_crash_point_names();
+    let result = harness::enumerate::run_all(&mut ctx, &names);
+    let _ = mock_proc.kill();
+    let (records, closure) = result?;
+
+    let jsonl = Path::new("chaos/results/sweep-main.jsonl");
+    let summary = Path::new("chaos/results/summary.md");
+    write_jsonl(jsonl, &records)?;
+    write_summary(summary, &records, &closure)?;
+
+    let total = records.len();
+    let passed = records.iter().filter(|r| r.passed()).count();
+    let failures: Vec<&_> = records.iter().filter(|r| !r.passed()).collect();
+    info!(
+        passed,
+        total,
+        closure_aborted = closure.aborted,
+        closure_total = closure.total,
+        "sweep complete; wrote chaos/results/sweep-main.jsonl + summary.md"
+    );
+    for f in &failures {
+        info!(crash_point = %f.crash_point, schedule = %f.schedule, violations = ?f.violations, "FAILURE");
+    }
+    if !closure.unreached.is_empty() {
+        bail!("registry closure failed; unreached crash points: {:?}", closure.unreached);
+    }
+    if !failures.is_empty() {
+        bail!("{} of {} runs FAILED (see chaos/results/summary.md)", failures.len(), total);
+    }
+    Ok(())
 }
 
 fn env_var(key: &str) -> Result<String> {
