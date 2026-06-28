@@ -2070,6 +2070,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chaos_hooks",
+ "diesel",
+ "dotenv",
+ "redis",
+ "reqwest",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2842,6 +2857,14 @@ dependencies = [
  "log",
  "wasi 0.11.1+wasi-snapshot-preview1",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "mock-mpc"
+version = "0.1.0"
+dependencies = [
+ "actix-web",
+ "serde_json",
 ]
 
 [[package]]

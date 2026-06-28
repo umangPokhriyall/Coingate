@@ -1,0 +1,36 @@
+[package]
+name = "harness"
+version = "0.1.0"
+edition = "2024"
+
+# The black-box supervisor (a dev/test binary, not shipped). It spawns the REAL `api` /
+# `processor` / `worker` / `relay` binaries as subprocesses and asserts via direct Postgres +
+# the `reconciler` + `mock-mpc` counts. It links NOTHING from the target crates (api/processor/
+# worker/relay/store/idempotency) — the only in-workspace dep is `chaos_hooks`, the crash-point
+# REGISTRY, which the supervisor iterates by name (it has no business logic, so the harness stays
+# black-box and runs unchanged against the legacy baseline in Session 2.2).
+[dependencies]
+chaos_hooks = { path = "../chaos_hooks" }
+
+# Reads the DB directly with raw SQL (no `store` schema linkage — keeps it black-box).
+diesel = { version = "2.1.4", features = ["postgres", "r2d2"] }
+redis = "0.24"
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+serde_json = "1.0"
+anyhow = "1.0"
+dotenv = "0.15"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+# Builds the `chaos_canary` throwaway with live crash-point fire-sites. The supervisor itself
+# never needs this; only the canary does. Build: `cargo build -p harness --features chaos`.
+chaos = ["chaos_hooks/chaos"]
+
+[[bin]]
+name = "harness"
+path = "src/main.rs"
+
+[[bin]]
+name = "chaos_canary"
+path = "src/bin/chaos_canary.rs"

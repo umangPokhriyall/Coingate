@@ -4,3 +4,6 @@ processor/.env
 store/.env
 worker/.env
 target/
+
+# Repo-root .env carries a real secret; only .env.example (secret blanked) is committed.
+/.env

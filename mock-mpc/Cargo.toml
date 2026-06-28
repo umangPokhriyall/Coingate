@@ -1,0 +1,12 @@
+[package]
+name = "mock-mpc"
+version = "0.1.0"
+edition = "2024"
+
+# The counting mock signer as an HTTP service. The worker runs UNMODIFIED (real `MpcSigner`,
+# real HTTP) against this. Phase 2 dependency allowlist: reuse `actix-web` (already a workspace
+# dep) + `serde_json`. No new deps — base58 is hand-rolled below so we need neither `bs58` nor
+# `solana-sdk` here.
+[dependencies]
+actix-web = "4.11.0"
+serde_json = "1.0"
