@@ -82,3 +82,12 @@ cargo build -p api -p processor -p worker -p relay -p mock-mpc -p reconciler -p 
   --features "api/chaos processor/chaos worker/chaos relay/chaos"
 target/debug/harness sweep        # writes chaos/results/sweep-main.jsonl + summary.md
 ```
+
+The proof is **hardware-independent**: a conservation invariant (0 violations, 1 send per
+withdrawal) is a *logical* property, not a timing one, and the crash-point enumeration is
+deterministic. It reproduces on any x86-64 with Postgres + Redis + a stable Rust toolchain —
+no PMU, no special silicon. That is the deliberate counterpart to the sibling repos whose
+claims *are* silicon-dependent (the TCP-server I/O teardown, the low-latency order book, the
+transcoding control plane), which were re-run and re-measured on rented AMD EPYC bare metal.
+Each repo states which of its claims depend on hardware and which do not — that separation is
+itself part of the signal.
