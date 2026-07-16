@@ -1,6 +1,6 @@
 # chaos_hooks
 
-Compile-out fail-point scaffolding for the exactly-once proof (Amendment 1 §A1).
+Compile-out fail-point scaffolding for the exactly-once verification harness.
 
 A `crash_point!(CrashPointId::X)` site models a real process death (`std::process::abort()`)
 at a precise point in a transaction. It is armed at runtime by setting
@@ -22,10 +22,10 @@ zero chaos code. The feature is off by default in every crate.
 
 - Variants are only ever **added** — never removed or renumbered — so a crash point's identity
   is stable across phases.
-- By the **end of Phase 1**, every `CrashPointId` variant MUST have **exactly one**
-  `crash_point!` fire-site in real code. (`SelfTest` is the Phase 0 exception: its only
+- Every `CrashPointId` variant MUST have **exactly one**
+  `crash_point!` fire-site in real code. (`SelfTest` is the exception: its only
   fire-site is the self-test.)
-- **Phase 2 asserts this closure** and iterates `CrashPointId::ALL` to drive the crash
+- **The harness asserts this closure** and iterates `CrashPointId::ALL` to drive the crash
   schedule across every point.
 
-When you add a variant, you are promising a matching fire-site by the Phase 1 deadline.
+When you add a variant, you are promising a matching fire-site in real code.

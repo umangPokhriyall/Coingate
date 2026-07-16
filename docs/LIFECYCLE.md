@@ -2,7 +2,7 @@
 
 Two business state machines carry the money: the **order** (a payment-in) and the **withdrawal**
 (a payment-out). A third, the **inbound idempotency key**, is the spine that makes the keyed write
-paths exactly-once (Amendment §A2). Each `CrashPointId` is placed against the transition it can
+paths exactly-once. Each `CrashPointId` is placed against the transition it can
 interrupt; the rebuilt code is clean at every one (`chaos/results/summary.md`).
 
 Legal transitions are guarded in SQL: an order moves `pending → paid` only via the gated credit
@@ -103,7 +103,7 @@ ASCII fallback:
 
 ---
 
-## 3. Inbound idempotency key: `in_progress → completed` (the §A2 spine)
+## 3. Inbound idempotency key: `in_progress → completed`
 
 Every keyed write (`/orders`, `/withdrawals`) runs its effect through this one spine. `acquire` is
 its own committed statement so concurrent replays can *see* `in_progress`; the guarded effect and

@@ -32,7 +32,7 @@ passed, 0 conservation violations, 0 re-sends**, all at `READ COMMITTED`.
 
 ## 2. Each failure mode → fix → proof
 
-The five findings are the original audit (`docs/specs/kickoff-brief.md` §1). For each: the bug, the
+The five findings come from the original audit of the pre-rebuild code. For each: the bug, the
 fix, and the committed rows that prove it. The legacy column below is the instrumented
 `pre-idempotency` build run under the **identical** black-box harness.
 
@@ -117,13 +117,13 @@ lease expires gets `409 + Retry-After`; after expiry, a takeover re-executes exa
 theorem in §3.
 
 **Proof.** Rebuilt: every `IdemAfter*` crash point is clean across all schedules, and the scripted
-§A2 schedules pass: `A2-takeover` on both `IdemAfterEffectBeforeComplete` and
+The takeover schedules pass: `A2-takeover` on both `IdemAfterEffectBeforeComplete` and
 `IdemAfterAcquireBeforeExecute` record `409 before expiry; exactly-once after`
 (`chaos/results/summary.md`).
 
 ---
 
-## 3. The takeover safety theorem (Amendment §A2, verbatim)
+## 3. The takeover safety theorem
 
 > The guarded effect and the transition to `completed` commit in a single transaction; therefore
 > `status = 'completed'` **if and only if** the effect has been durably applied. Consider an
@@ -137,14 +137,14 @@ theorem in §3.
 > status='in_progress' AND lease_owner=self` admits exactly one winner; the loser's `UPDATE` matches
 > 0 rows and its effect rolls back with the aborted transaction.
 
-This is exercised end-to-end by the §A2 scripted schedules (`chaos/results/summary.md`, the two
+This is exercised end-to-end by the scripted takeover schedules (`chaos/results/summary.md`, the two
 `A2-takeover` rows): the api aborts mid-Execute leaving the key `in_progress`; a replay before lease
 expiry returns `409`; after expiry the takeover re-executes, leaving **exactly one** withdrawal and
 one lock, conservation intact.
 
 ---
 
-## 4. The isolation argument (Amendment §A4) and its counterexample
+## 4. The isolation argument and its counterexample
 
 The whole proof runs at `READ COMMITTED` — recorded in every record of
 `chaos/results/sweep-main.jsonl` (`"isolation":"read committed"`). There is no `SERIALIZABLE`
@@ -170,7 +170,7 @@ claimed.
 
 ---
 
-## 5. At-least-once is a feature (Amendment §A3)
+## 5. At-least-once is a feature
 
 The outbox relay crashing between its `XADD` and `mark-sent` republishes the same row on restart —
 **by design**; the outbox is at-least-once. That is safe because the consumer absorbs the

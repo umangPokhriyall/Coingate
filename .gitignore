@@ -7,3 +7,7 @@ target/
 
 # Repo-root .env carries a real secret; only .env.example (secret blanked) is committed.
 /.env
+# Internal development documents live in ../repo-internal/ and are never shipped.
+CLAUDE.md
+docs/specs/
+docs/x-thread.md

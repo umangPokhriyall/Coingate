@@ -1,9 +1,9 @@
-# Phase 2 — Exhaustive crash-point sweep (main)
+# Exhaustive crash-point sweep (main)
 
 **Headline:** a process crash at every statement boundary in the pipeline, under every redelivery schedule — **0 conservation violations, 0 re-sends** across 62 runs.
 
 - Runs: **62/62 passed** (all five invariants held).
-- Isolation: **READ COMMITTED** (recorded in every record — Amendment §A4).
+- Isolation: **READ COMMITTED** (recorded in every record).
 - Registry closure: **14/14 crash points aborted** under their driving workload (every variant has a live, reachable fire-site).
 
 ## Per-crash-point pass grid
